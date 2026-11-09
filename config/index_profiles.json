@@ -1,0 +1,18 @@
+{
+  "portable-local": {
+    "index_type": "HNSW_PQ",
+    "metric_type": "IP",
+    "params": {"M": 24, "efConstruction": 320, "m": 64, "nbits": 8, "refine": true, "refine_type": "SQ8"},
+    "search_params": {"ef": 160, "refine_k": 2},
+    "max_rows": 8000000
+  },
+  "quality-gpu": {
+    "index_type": "GPU_CAGRA",
+    "metric_type": "IP",
+    "params": {"intermediate_graph_degree": 64, "graph_degree": 32, "build_algo": "IVF_PQ", "cache_dataset_on_device": false},
+    "search_params": {"itopk_size": 256, "search_width": 4},
+    "gpu_vram_bytes": 25769803776,
+    "safe_vram_fraction": 0.8,
+    "max_rows": 8000000
+  }
+}

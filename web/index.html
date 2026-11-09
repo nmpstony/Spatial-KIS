@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
+  <title>Spatial KIS - Tìm kiếm Video theo Không gian</title>
+  <link rel="stylesheet" href="/style.css?v=3.1">
+</head>
+<body>
+<main>
+  <h1>Spatial KIS</h1>
+  <p class="muted">Truy vấn mô tả + vị trí không gian (Spatial Regions). Kết hợp AND nhiều điều kiện, định vị chính xác vật thể theo từng góc/cạnh khung hình.</p>
+  
+  <h3>Điều kiện tìm kiếm</h3>
+  <section id="conditions"></section>
+  <div class="controls-row">
+    <button id="add" type="button">+ Thêm điều kiện</button>
+    <label><input id="expand" type="checkbox"> Tự động dịch Việt–Anh local</label>
+    <label><input id="diversify" type="checkbox"> Đa dạng theo shot</label>
+  </div>
+
+  <button id="search">🔍 Bắt đầu Tìm kiếm</button>
+  <p id="status"></p>
+  <section id="results" class="results"></section>
+</main>
+
+<dialog id="inspect">
+  <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+    <h3 style="margin:0;">Xem Video Keyframe</h3>
+    <button onclick="closeInspect()" style="background:#3b2327; border-color:#78353d; color:#ff7b72;">✕ Đóng</button>
+  </div>
+  <video id="player" controls playsinline></video>
+  <p id="details" style="margin-top:10px; font-family:Consolas,monospace; font-size:13px; color:#aeb8c8;"></p>
+</dialog>
+
+<script src="/app.js?v=3.1"></script>
+</body>
+</html>

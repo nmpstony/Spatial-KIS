@@ -1,0 +1,37 @@
+services:
+  milvus-etcd:
+    container_name: spatial-kis-etcd
+    image: quay.io/coreos/etcd:v3.5.18
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    volumes: [./volumes/etcd:/etcd]
+  milvus-minio:
+    container_name: spatial-kis-minio
+    image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+    environment: {MINIO_ACCESS_KEY: minioadmin, MINIO_SECRET_KEY: minioadmin}
+    command: minio server /minio_data
+    volumes: [./volumes/minio:/minio_data]
+    ports: ["9001:9001"]
+  milvus-standalone:
+    container_name: spatial-kis-milvus
+    image: milvusdb/milvus:v2.5.16
+    command: ["milvus", "run", "standalone"]
+    security_opt: ["seccomp:unconfined"]
+    environment: {ETCD_ENDPOINTS: milvus-etcd:2379, MINIO_ADDRESS: milvus-minio:9000}
+    volumes: [./volumes/milvus:/var/lib/milvus, ./milvus.yaml:/milvus/configs/milvus.yaml:ro]
+    ports: ["19530:19530", "9091:9091"]
+    depends_on: [milvus-etcd, milvus-minio]
+  app:
+    build: .
+    profiles: [app]
+    environment:
+      - MILVUS_URI=http://milvus-standalone:19530
+      - SPATIAL_KIS_ARTIFACT=/data/artifact
+      - SPATIAL_KIS_VIDEO_ROOT=/data/videos
+    ports: ["8010:8010"]
+    volumes: [./artifacts/current:/data/artifact:ro, ../videos:/data/videos:ro]
+    depends_on: [milvus-standalone]

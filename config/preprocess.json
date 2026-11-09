@@ -1,0 +1,13 @@
+{
+  "model_name": "ViT-B-16",
+  "pretrained": "laion2b_s34b_b88k",
+  "candidate_fps": 2.0,
+  "semantic_distance_threshold": 0.13,
+  "max_gap_seconds": 8.0,
+  "min_sharpness": 55.0,
+  "grid_overlap": 0.12,
+  "webp_quality": 85,
+  "long_edge": 1280,
+  "batch_size": 48,
+  "device": "auto"
+}

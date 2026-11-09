@@ -1,0 +1,11 @@
+# Overlay for the optional quality-gpu profile. Use only on a host with NVIDIA
+# Container Toolkit and a compatible GPU-enabled Milvus build.
+services:
+  milvus-standalone:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
