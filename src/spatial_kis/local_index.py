@@ -116,18 +116,32 @@ class LocalMemmapIndex:
         )
         print(f"[LocalMemmapIndex] Built {count:,} keyframes x 10 regions ({dim}D).", flush=True)
 
-    @lru_cache(maxsize=3)
-    def _region_tensor_fp32(self, region_id: int) -> torch.Tensor:
-        """Cache up to 3 regions in float32 RAM (~1.29 GB each) for sub-100ms BLAS matmul."""
+    @lru_cache(maxsize=1)
+    def _region_tensor_fp32(self, region_id: int = 0) -> torch.Tensor:
+        """Keep region 0 (full frame) permanently in float32 RAM (~1.29 GB) for sub-100ms BLAS matmul."""
         arr = np.array(self._mmaps[region_id], dtype=np.float32, copy=True)
         return torch.from_numpy(arr)
+
+    def _matmul_region(self, region_id: int, q_tensor: torch.Tensor) -> torch.Tensor:
+        """Multiply region [N, dim] by q_tensor [dim, M] without evicting OS page cache."""
+        if region_id == 0:
+            return torch.matmul(self._region_tensor_fp32(0), q_tensor)
+        mmap_arr = self._mmaps[region_id]
+        n = self.count
+        m = q_tensor.shape[1]
+        out = torch.empty((n, m), dtype=torch.float32)
+        step = 131072
+        for start in range(0, n, step):
+            end = min(start + step, n)
+            chunk = torch.from_numpy(np.array(mmap_arr[start:end], dtype=np.float32, copy=True))
+            torch.matmul(chunk, q_tensor, out=out[start:end])
+        return out
 
     def score_region(self, region_id: int, query_vectors: list[list[float]]) -> np.ndarray:
         """Return max inner-product score per keyframe across query_vectors for a single region."""
         q = torch.tensor(query_vectors, dtype=torch.float32).T  # [dim, V]
-        mat = self._region_tensor_fp32(region_id)  # [N, dim]
         with torch.no_grad():
-            scores = torch.matmul(mat, q)  # [N, V]
+            scores = self._matmul_region(region_id, q)  # [N, V]
             if scores.shape[1] == 1:
                 return scores[:, 0].numpy()
             return scores.max(dim=1).values.numpy()
@@ -177,8 +191,7 @@ class LocalMemmapIndex:
         with torch.no_grad():
             for reg, q_list in region_queries.items():
                 q_tensor = torch.tensor(q_list, dtype=torch.float32).T  # [dim, M]
-                mat = self._region_tensor_fp32(reg)  # [N, dim]
-                region_score_matrices[reg] = torch.matmul(mat, q_tensor)  # [N, M]
+                region_score_matrices[reg] = self._matmul_region(reg, q_tensor)  # [N, M]
 
         def eval_single_cond(cond_idx: int) -> tuple[np.ndarray, np.ndarray]:
             slices_for_cond = cond_region_slices[cond_idx]
