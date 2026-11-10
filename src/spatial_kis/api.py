@@ -50,12 +50,12 @@ class Condition(BaseModel):
     text: str = Field(min_length=1, max_length=500)
     region: str = "all"
     weight: float = Field(default=1.0, gt=0, le=10)
-    stage: int = Field(default=1, ge=1, le=5)
+    stage: int = Field(default=1, ge=1, le=10)
     variants: list[str] | None = None
 
 
 class SearchRequest(BaseModel):
-    conditions: list[Condition] = Field(min_length=1, max_length=6)
+    conditions: list[Condition] = Field(min_length=1, max_length=12)
     top_k: int = Field(default=300, ge=20, le=2048)
     result_limit: int = Field(default=60, ge=1, le=200)
     diversify: bool = True

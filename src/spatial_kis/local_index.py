@@ -197,10 +197,11 @@ class LocalMemmapIndex:
             assert best_scores is not None and best_regions is not None
             return best_scores, best_regions
 
-        stage1_indices = [i for i, item in enumerate(evaluated_conditions) if item[3] <= 1]
-        stage2_indices = [i for i, item in enumerate(evaluated_conditions) if item[3] >= 2]
-        if not stage1_indices:
-            stage1_indices, stage2_indices = stage2_indices, []
+        unique_stages = sorted({max(1, int(item[3])) for item in evaluated_conditions})
+        stage_groups: list[tuple[int, list[int]]] = [
+            (st, [i for i, item in enumerate(evaluated_conditions) if max(1, int(item[3])) == st])
+            for st in unique_stages
+        ]
 
         def normalize_distribution(scores: np.ndarray) -> np.ndarray:
             if self.count < 16:
@@ -235,46 +236,83 @@ class LocalMemmapIndex:
                 combined = w_sum / denom
             return combined, primary_regions, raw_scores_list
 
-        s1_combined, s1_regions, s1_raw = combine_stage(stage1_indices)
-        w1_total = sum(float(evaluated_conditions[i][2]) for i in stage1_indices)
+        stage_evals = [combine_stage(c_idxs) for _, c_idxs in stage_groups]
+        stage_weights = [
+            sum(float(evaluated_conditions[i][2]) for i in c_idxs) for _, c_idxs in stage_groups
+        ]
+        s1_combined, s1_regions, s1_raw = stage_evals[0]
 
-        matched_next_idx: dict[int, int] = {}
-        if stage2_indices:
-            s2_combined, _, _ = combine_stage(stage2_indices)
-            w2_total = sum(float(evaluated_conditions[i][2]) for i in stage2_indices)
+        matched_chains: dict[int, list[tuple[int, int]]] = {}
+        num_stages = len(stage_groups)
+        if num_stages >= 2:
             final_scores = np.zeros(self.count, dtype=np.float32)
-            # Symmetric candidate selection: include videos from top Stage-1 OR top Stage-2 hits
-            cand_k = min(6000, self.count)
-            top_s1 = np.argpartition(s1_combined, -cand_k)[-cand_k:]
-            top_s2 = np.argpartition(s2_combined, -cand_k)[-cand_k:]
-            cand_videos = {self.records[int(i)]["video_stem"] for i in top_s1} | {
-                self.records[int(i)]["video_stem"] for i in top_s2
-            }
+            cand_k = min(12000, self.count)
+            stage_video_sets: list[set[str]] = []
+            for st_comb, _, _ in stage_evals:
+                top_st = np.argpartition(st_comb, -cand_k)[-cand_k:]
+                stage_video_sets.append({self.records[int(i)]["video_stem"] for i in top_st})
+            cand_videos = set.intersection(*stage_video_sets) if stage_video_sets else set()
+            if not cand_videos and stage_video_sets:
+                cand_videos = set.union(*stage_video_sets)
+
+            w_total_all = sum(stage_weights)
+            inf = float("inf")
+            min_stage_norm = 0.32 if self.count >= 1000 else 0.15
             for stem in cand_videos:
                 v_idxs = self.by_video.get(stem, [])
                 n_v = len(v_idxs)
-                if n_v < 2:
+                if n_v < num_stages:
                     continue
                 times = [self.records[i]["timestamp"] for i in v_idxs]
-                s1_vals = [float(s1_combined[i]) for i in v_idxs]
-                s2_vals = [float(s2_combined[i]) for i in v_idxs]
+                st_vals = [[float(stage_evals[s][0][i]) for i in v_idxs] for s in range(num_stages)]
+
+                # Backward DP over stages s = num_stages-1 down to 0 to minimize harmonic denominator sum(W_s / score_s)
+                dp_denom = [[inf] * n_v for _ in range(num_stages)]
+                next_hop = [[-1] * n_v for _ in range(num_stages)]
+
+                w_last = stage_weights[-1]
                 for a in range(n_v):
-                    if s1_vals[a] < 0.25:
-                        continue
-                    t_a = times[a]
-                    best_b = -1
-                    best_s2 = -1.0
-                    for b in range(a + 1, n_v):
-                        dt = times[b] - t_a
-                        if dt > max_temporal_gap:
-                            break
-                        if dt >= 0.5 and s2_vals[b] > best_s2:
-                            best_s2 = s2_vals[b]
-                            best_b = v_idxs[b]
-                    if best_b >= 0 and best_s2 >= 0.25:
+                    val = st_vals[-1][a]
+                    if val >= min_stage_norm:
+                        dp_denom[-1][a] = w_last / val
+
+                for s in range(num_stages - 2, -1, -1):
+                    w_s = stage_weights[s]
+                    vals_s = st_vals[s]
+                    next_denom = dp_denom[s + 1]
+                    for a in range(n_v):
+                        val_a = vals_s[a]
+                        if val_a < min_stage_norm:
+                            continue
+                        t_a = times[a]
+                        best_b = -1
+                        best_d = inf
+                        for b in range(a + 1, n_v):
+                            dt = times[b] - t_a
+                            if dt > max_temporal_gap:
+                                break
+                            if dt >= 0.5 and next_denom[b] < best_d:
+                                best_d = next_denom[b]
+                                best_b = b
+                        if best_b >= 0 and best_d < inf:
+                            dp_denom[s][a] = (w_s / val_a) + best_d
+                            next_hop[s][a] = best_b
+
+                for a in range(n_v):
+                    d_total = dp_denom[0][a]
+                    if d_total < inf:
                         idx_a = v_idxs[a]
-                        final_scores[idx_a] = (w1_total + w2_total) / (w1_total / s1_vals[a] + w2_total / best_s2)
-                        matched_next_idx[idx_a] = best_b
+                        final_scores[idx_a] = w_total_all / d_total
+                        chain: list[tuple[int, int]] = []
+                        curr = a
+                        for s in range(num_stages - 1):
+                            nxt = next_hop[s][curr]
+                            if nxt < 0:
+                                break
+                            chain.append((stage_groups[s + 1][0], v_idxs[nxt]))
+                            curr = nxt
+                        if chain:
+                            matched_chains[idx_a] = chain
         else:
             final_scores = s1_combined
 
@@ -292,15 +330,20 @@ class LocalMemmapIndex:
                 "region_id": int(s1_regions[idx_int]),
                 "condition_scores": [float(arr[idx_int]) for arr in s1_raw],
             }
-            if idx_int in matched_next_idx:
-                next_rec = self.records[matched_next_idx[idx_int]]
-                entry["next_match"] = {
-                    "keyframe_id": next_rec["keyframe_id"],
-                    "frame_id": next_rec["frame_id"],
-                    "timestamp": next_rec["timestamp"],
-                    "timestamp_ms": next_rec["timestamp_ms"],
-                    "image_path": next_rec["image_path"],
-                }
+            if idx_int in matched_chains:
+                next_list = []
+                for st_num, m_idx in matched_chains[idx_int]:
+                    next_rec = self.records[m_idx]
+                    next_list.append({
+                        "stage": st_num,
+                        "keyframe_id": next_rec["keyframe_id"],
+                        "frame_id": next_rec["frame_id"],
+                        "timestamp": next_rec["timestamp"],
+                        "timestamp_ms": next_rec["timestamp_ms"],
+                        "image_path": next_rec["image_path"],
+                    })
+                entry["next_matches"] = next_list
+                entry["next_match"] = next_list[0]
             ranked.append(entry)
 
         results = diversify_by_shot(ranked, result_limit) if diversify else ranked[:result_limit]

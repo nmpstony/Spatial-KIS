@@ -497,7 +497,7 @@ function getConditions() {
           text: text || expanded,
           region,
           weight,
-          stage: Math.min(stage, 2),
+          stage: Math.min(stage, 10),
           variants: expanded ? [expanded] : null
         });
       }
@@ -605,23 +605,31 @@ async function runSearch() {
       const ms = item.timestamp_ms !== undefined ? item.timestamp_ms : Math.round((item.timestamp || 0) * 1000);
 
       const regionTag = `<span class="card-tag">Vùng: <b>${regionNames[item.region_id] || item.region_id}</b></span>`;
+      const nextList = item.next_matches || (item.next_match ? [{ stage: 2, ...item.next_match }] : []);
       let nextTag = '';
       let stage1LabelHtml = '';
       let nextPreviewHtml = '';
-      if (item.next_match) {
-        const nextImg = `/media/keyframe/${item.next_match.image_path.replace(/^images\//, '')}`;
-        nextTag = `<span class="card-tag next-tag" title="Bấm để xem Cảnh 2">⏩ Cảnh 2 @ ${item.next_match.timestamp_ms}ms</span>`;
+      if (nextList.length > 0) {
         stage1LabelHtml = `<div style="font-size:11px; color:#79c0ff; text-align:center; margin-top:2px;">🎬 Cảnh 1: ${ms} ms (#${item.frame_id})</div>`;
-        nextPreviewHtml = `
-          <div class="next-scene-box" title="Ảnh của Cảnh 2 tiếp theo tại ${item.next_match.timestamp_ms} ms">
-            <img src="${nextImg}" loading="lazy" style="aspect-ratio:16/9; width:100%; border-radius:4px; border:1px solid #8957e5; margin-top:4px;">
-            <div style="font-size:11px; color:#d2a8ff; text-align:center;">⏩ Cảnh 2: ${item.next_match.timestamp_ms} ms (#${item.next_match.frame_id})</div>
-          </div>
-        `;
+        nextTag = nextList
+          .map((nm, idx) => `<span class="card-tag next-tag" data-next-idx="${idx}" title="Bấm để xem Cảnh ${nm.stage || idx + 2}">⏩ Cảnh ${nm.stage || idx + 2} @ ${nm.timestamp_ms}ms</span>`)
+          .join(' ');
+        nextPreviewHtml = nextList
+          .map((nm, idx) => {
+            const nextImg = `/media/keyframe/${nm.image_path.replace(/^images\//, '')}`;
+            const stNum = nm.stage || idx + 2;
+            return `
+              <div class="next-scene-box" data-next-idx="${idx}" title="Ảnh của Cảnh ${stNum} tiếp theo tại ${nm.timestamp_ms} ms">
+                <img src="${nextImg}" loading="lazy" style="aspect-ratio:16/9; width:100%; border-radius:4px; border:1px solid #8957e5; margin-top:4px;">
+                <div style="font-size:11px; color:#d2a8ff; text-align:center;">⏩ Cảnh ${stNum}: ${nm.timestamp_ms} ms (#${nm.frame_id})</div>
+              </div>
+            `;
+          })
+          .join('');
       }
 
       card.innerHTML = `
-        <img src="${imgA}" alt="${item.keyframe_id}" loading="lazy" title="Cảnh 1 — Bấm để xem video và các frame lân cận">
+        <img class="stage1-img" src="${imgA}" alt="${item.keyframe_id}" loading="lazy" title="Cảnh 1 — Bấm để xem video và các frame lân cận">
         ${stage1LabelHtml}
         ${nextPreviewHtml}
         <div class="card-meta">
@@ -645,14 +653,16 @@ async function runSearch() {
         </div>
       `;
 
-      card.querySelector('img').onclick = () => inspectResult(item);
-      const nextBox = card.querySelector('.next-scene-box');
-      if (nextBox && item.next_match) {
-        nextBox.onclick = (e) => {
+      card.querySelector('.stage1-img').onclick = () => inspectResult(item);
+      card.querySelectorAll('.next-scene-box, .next-tag').forEach((el) => {
+        el.onclick = (e) => {
           e.stopPropagation();
-          inspectResult({ ...item, ...item.next_match });
+          const idx = Number(el.dataset.nextIdx) || 0;
+          if (nextList[idx]) {
+            inspectResult({ ...item, ...nextList[idx] });
+          }
         };
-      }
+      });
       card.querySelector('.view-btn').onclick = () => inspectResult(item);
       card.querySelector('.copy-btn').onclick = async () => {
         const qaVal = qaAnswerInput.value.trim();
