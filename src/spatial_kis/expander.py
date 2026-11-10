@@ -14,8 +14,8 @@ _FILLER_PREFIXES = re.compile(
 
 # Vietnamese terms that MarianMT (opus-mt-vi-en) commonly mistranslates
 _VI_PRE_REPLACEMENTS: list[tuple[re.Pattern, str]] = [
-    (re.compile(r"\b(cano|ca\s*nô|ca-nô)\b", re.IGNORECASE), "tàu cao tốc ca nô"),
-    (re.compile(r"\bflycam\b", re.IGNORECASE), "góc nhìn từ trên cao"),
+    (re.compile(r"\b(cano|ca\s*nô|ca-nô)\b", re.IGNORECASE), "speedboat"),
+    (re.compile(r"\bflycam\b", re.IGNORECASE), "aerial view from above"),
     (re.compile(r"\b(mc|biên\s+tập\s+viên|btv)\b", re.IGNORECASE), "người dẫn chương trình truyền hình"),
     (re.compile(r"\báo\s+dài\b", re.IGNORECASE), "trang phục áo dài truyền thống"),
     (re.compile(r"\bkhẩu\s+trang\b", re.IGNORECASE), "khẩu trang y tế che mặt"),
