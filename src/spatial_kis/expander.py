@@ -1,10 +1,11 @@
-"""Offline-only Vietnamese query expansion with visual prompt normalization."""
+"""Offline-only Vietnamese query expansion with thread-safe initialization and visual prompt normalization."""
 from __future__ import annotations
 
 import os
 import re
-from functools import lru_cache
+import threading
 import torch
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
 # Common Vietnamese prefixes in KIS descriptions that hurt CLIP embeddings if translated literally
 _FILLER_PREFIXES = re.compile(
@@ -23,7 +24,7 @@ _VI_PRE_REPLACEMENTS: list[tuple[re.Pattern, str]] = [
 
 _EN_POST_REPLACEMENTS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"\bspeedbolat\b", re.IGNORECASE), "speedboat"),
-    (re.compile(r"\bcane\b", re.IGNORECASE), "motorboat"),
+    (re.compile(r"\bcane\b", re.IGNORECASE), "speedboat"),
     (re.compile(r"^there\s+is\s+a\s+scene\s+of\s+", re.IGNORECASE), ""),
     (re.compile(r"^there'?s\s+a\s+", re.IGNORECASE), "a "),
     (re.compile(r"^there\s+are\s+", re.IGNORECASE), ""),
@@ -44,10 +45,9 @@ def clean_vi_prompt(text: str) -> tuple[str, bool]:
 
 class LocalExpander:
     def __init__(self, model_name: str | None = None) -> None:
-        from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
-
         self.model_name = model_name or os.getenv("SPATIAL_KIS_TRANSLATION_MODEL", "Helsinki-NLP/opus-mt-vi-en")
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self._lock = threading.Lock()
         try:
             self.tokenizer = AutoTokenizer.from_pretrained(self.model_name, local_files_only=True)
             self.model = AutoModelForSeq2SeqLM.from_pretrained(self.model_name, local_files_only=True).to(self.device).eval()
@@ -57,15 +57,16 @@ class LocalExpander:
 
     def translate(self, text: str) -> str:
         cleaned, has_cano = clean_vi_prompt(text)
-        tokens = self.tokenizer([cleaned], return_tensors="pt", truncation=True).to(self.device)
-        with torch.no_grad():
-            generated = self.model.generate(**tokens, max_new_tokens=64)
-        translated = self.tokenizer.decode(generated[0], skip_special_tokens=True).strip()
+        with self._lock:
+            tokens = self.tokenizer([cleaned], return_tensors="pt", truncation=True).to(self.device)
+            with torch.no_grad():
+                generated = self.model.generate(**tokens, max_new_tokens=64)
+            translated = self.tokenizer.decode(generated[0], skip_special_tokens=True).strip()
         translated = re.sub(r"[.!?]+$", "", translated).strip()
         for pattern, repl in _EN_POST_REPLACEMENTS:
             translated = pattern.sub(repl, translated).strip()
         if has_cano and "boat" not in translated.lower() and "speedboat" not in translated.lower():
-            translated = f"speedboat motorboat {translated}".strip()
+            translated = f"speedboat {translated}".strip()
         return translated
 
     def expand(self, text: str) -> list[str]:
@@ -77,18 +78,27 @@ class LocalExpander:
             translated = self.translate(text)
             if translated and translated.lower() != text.lower():
                 outputs.append(translated)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"Warning: LocalExpander.translate failed: {e}", flush=True)
         return list(dict.fromkeys(outputs))
 
 
-@lru_cache
+_EXPANDER_INSTANCE: LocalExpander | None = None
+_EXPANDER_LOCK = threading.Lock()
+
+
 def expander() -> LocalExpander | None:
-    try:
-        return LocalExpander()
-    except Exception as e:
-        print(f"Warning: LocalExpander init failed: {e}")
-        return None
+    global _EXPANDER_INSTANCE
+    if _EXPANDER_INSTANCE is not None:
+        return _EXPANDER_INSTANCE
+    with _EXPANDER_LOCK:
+        if _EXPANDER_INSTANCE is None:
+            try:
+                _EXPANDER_INSTANCE = LocalExpander()
+            except Exception as e:
+                print(f"Warning: LocalExpander init failed: {e}", flush=True)
+                return None
+    return _EXPANDER_INSTANCE
 
 
 def variants(text: str) -> list[str]:

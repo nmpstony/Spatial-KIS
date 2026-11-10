@@ -17,7 +17,7 @@ const regionDefs = [
   { id: "bottom_right", label: "bottom_right (Góc dưới phải: ô 9)" }
 ];
 
-const box = document.querySelector('#conditions'),
+const scenesContainer = document.querySelector('#scenes-container'),
       results = document.querySelector('#results'),
       status = document.querySelector('#status'),
       inspect = document.querySelector('#inspect'),
@@ -348,22 +348,18 @@ document.querySelector('#modal-submit-qa').onclick = () => {
   submitToDres(currentInspectItem.video_id, curMs, 'qa');
 };
 
-function addCondition(target, value = { text: '', region: 'all', weight: 1, stage: 1, expanded: '' }) {
+function addConditionToScene(conditionsListEl, value = { text: '', region: 'all', weight: 1, expanded: '' }) {
   const wrapper = document.createElement('div');
-  wrapper.className = 'condition-wrapper' + (value.stage === 2 ? ' stage-2' : '');
+  wrapper.className = 'condition-wrapper';
   wrapper.innerHTML = `
     <div class="condition">
-      <select class="stage-select" title="Giai đoạn cảnh trong video">
-        <option value="1" ${value.stage !== 2 ? 'selected' : ''}>🎬 Cảnh 1 (Chính)</option>
-        <option value="2" ${value.stage === 2 ? 'selected' : ''}>⏩ Cảnh 2 (Tiếp theo)</option>
-      </select>
       <input class="query-text" aria-label="Mô tả" placeholder="Nhập mô tả tiếng Việt hoặc tiếng Anh (Nhấn Enter để tìm ngay)..." value="${value.text}">
       <select class="region-select">
         ${regionDefs.map(x => `<option value="${x.id}" ${x.id === value.region ? 'selected' : ''}>${x.label}</option>`).join('')}
       </select>
       <input class="weight-input" aria-label="Trọng số" type="number" min="0.1" max="10" step="0.1" value="${value.weight}" title="Trọng số (Weight)">
       <button class="expand-btn" type="button" title="Dịch sang tiếng Anh / Mở rộng">🌐 Dịch EN</button>
-      <button class="delete-btn" type="button" title="Xóa điều kiện">×</button>
+      <button class="delete-btn" type="button" title="Xóa điều kiện này">×</button>
     </div>
     <div class="expanded-row">
       <span class="expanded-label">✨ Query EN (có thể sửa tay):</span>
@@ -371,18 +367,13 @@ function addCondition(target, value = { text: '', region: 'all', weight: 1, stag
     </div>
   `;
 
-  const stageSelect = wrapper.querySelector('.stage-select');
   const queryInput = wrapper.querySelector('.query-text');
   const expandedInput = wrapper.querySelector('.expanded-input');
   const expandBtn = wrapper.querySelector('.expand-btn');
   const deleteBtn = wrapper.querySelector('.delete-btn');
 
-  stageSelect.onchange = () => {
-    wrapper.classList.toggle('stage-2', Number(stageSelect.value) === 2);
-  };
-
   deleteBtn.onclick = () => {
-    if (document.querySelectorAll('.condition-wrapper').length > 1) {
+    if (conditionsListEl.querySelectorAll('.condition-wrapper').length > 1) {
       wrapper.remove();
     } else {
       queryInput.value = '';
@@ -415,7 +406,6 @@ function addCondition(target, value = { text: '', region: 'all', weight: 1, stag
 
   expandBtn.onclick = triggerExpand;
 
-  // Clear stale auto-translation if user edits the Vietnamese query
   queryInput.addEventListener('input', () => {
     if (expandedInput.dataset.auto === 'true') {
       expandedInput.value = '';
@@ -425,7 +415,6 @@ function addCondition(target, value = { text: '', region: 'all', weight: 1, stag
     expandedInput.dataset.auto = 'manual';
   });
 
-  // Press Enter to search immediately
   [queryInput, expandedInput].forEach(inp => {
     inp.addEventListener('keydown', (ev) => {
       if (ev.key === 'Enter') {
@@ -435,31 +424,90 @@ function addCondition(target, value = { text: '', region: 'all', weight: 1, stag
     });
   });
 
-  target.append(wrapper);
+  conditionsListEl.append(wrapper);
   queryInput.focus();
 }
 
-function getConditions(target) {
-  return [...target.querySelectorAll('.condition-wrapper')].map(wrapper => {
-    const stage = Number(wrapper.querySelector('.stage-select').value) || 1;
-    const text = wrapper.querySelector('.query-text').value.trim();
-    const region = wrapper.querySelector('.region-select').value;
-    const weight = Number(wrapper.querySelector('.weight-input').value) || 1.0;
-    const expanded = wrapper.querySelector('.expanded-input').value.trim();
-
-    return {
-      text: text || expanded,
-      region,
-      weight,
-      stage,
-      variants: expanded ? [expanded] : null
-    };
-  }).filter(x => x.text);
+function refreshSceneLabels() {
+  const sceneBoxes = [...scenesContainer.querySelectorAll('.scene-box')];
+  sceneBoxes.forEach((sceneBox, idx) => {
+    const stageNum = idx + 1;
+    sceneBox.dataset.stage = String(stageNum);
+    sceneBox.classList.toggle('scene-subsequent', stageNum > 1);
+    const titleEl = sceneBox.querySelector('.scene-title');
+    const addCondBtn = sceneBox.querySelector('.add-cond-btn');
+    const removeSceneBtn = sceneBox.querySelector('.remove-scene-btn');
+    if (stageNum === 1) {
+      titleEl.textContent = '🎬 Cảnh 1 (Khung hình chính — Các điều kiện bên dưới xuất hiện trong CÙNG Cảnh 1)';
+    } else {
+      titleEl.textContent = `⏩ Cảnh ${stageNum} (Xảy ra tiếp theo sau Cảnh ${stageNum - 1} trong cùng Video)`;
+    }
+    if (addCondBtn) {
+      addCondBtn.textContent = `+ Thêm điều kiện (Cùng Cảnh ${stageNum})`;
+    }
+    if (removeSceneBtn) {
+      removeSceneBtn.style.display = stageNum > 1 ? 'inline-block' : 'none';
+    }
+  });
 }
 
-document.querySelector('#add').onclick = () => addCondition(box, { text: '', region: 'all', weight: 1, stage: 1, expanded: '' });
-document.querySelector('#add-temporal').onclick = () => addCondition(box, { text: '', region: 'all', weight: 1, stage: 2, expanded: '' });
-addCondition(box);
+function addSceneBox() {
+  const currentCount = scenesContainer.querySelectorAll('.scene-box').length;
+  const stageNum = currentCount + 1;
+  const sceneBox = document.createElement('div');
+  sceneBox.className = 'scene-box' + (stageNum > 1 ? ' scene-subsequent' : '');
+  sceneBox.dataset.stage = String(stageNum);
+
+  sceneBox.innerHTML = `
+    <div class="scene-header">
+      <span class="scene-title"></span>
+      <div class="scene-actions">
+        <button type="button" class="add-cond-btn">+ Thêm điều kiện</button>
+        <button type="button" class="btn-danger remove-scene-btn" title="Xóa toàn bộ Cảnh này">🗑️ Xóa Cảnh</button>
+      </div>
+    </div>
+    <div class="scene-conditions"></div>
+  `;
+
+  const conditionsListEl = sceneBox.querySelector('.scene-conditions');
+  sceneBox.querySelector('.add-cond-btn').onclick = () => addConditionToScene(conditionsListEl);
+  sceneBox.querySelector('.remove-scene-btn').onclick = () => {
+    sceneBox.remove();
+    refreshSceneLabels();
+  };
+
+  scenesContainer.append(sceneBox);
+  refreshSceneLabels();
+  addConditionToScene(conditionsListEl);
+}
+
+function getConditions() {
+  const all = [];
+  const sceneBoxes = [...scenesContainer.querySelectorAll('.scene-box')];
+  sceneBoxes.forEach((sceneBox, idx) => {
+    const stage = idx + 1;
+    const wrappers = [...sceneBox.querySelectorAll('.condition-wrapper')];
+    for (const wrapper of wrappers) {
+      const text = wrapper.querySelector('.query-text').value.trim();
+      const region = wrapper.querySelector('.region-select').value;
+      const weight = Number(wrapper.querySelector('.weight-input').value) || 1.0;
+      const expanded = wrapper.querySelector('.expanded-input').value.trim();
+      if (text || expanded) {
+        all.push({
+          text: text || expanded,
+          region,
+          weight,
+          stage: Math.min(stage, 2),
+          variants: expanded ? [expanded] : null
+        });
+      }
+    }
+  });
+  return all;
+}
+
+document.querySelector('#add-scene').onclick = () => addSceneBox();
+addSceneBox();
 
 async function runSearch() {
   const isAutoExpand = document.querySelector('#expand').checked;
@@ -468,7 +516,7 @@ async function runSearch() {
 
   if (isAutoExpand) {
     const wrappers = [...document.querySelectorAll('.condition-wrapper')];
-    await Promise.all(wrappers.map(async (wrapper) => {
+    for (const wrapper of wrappers) {
       const q = wrapper.querySelector('.query-text').value.trim();
       const exp = wrapper.querySelector('.expanded-input');
       if (q && !exp.value.trim()) {
@@ -486,10 +534,10 @@ async function runSearch() {
           }
         } catch (_) {}
       }
-    }));
+    }
   }
 
-  const c = getConditions(box);
+  const c = getConditions();
   if (!c.length) {
     status.textContent = '⚠ Vui lòng nhập ít nhất 1 điều kiện tìm kiếm.';
     return;

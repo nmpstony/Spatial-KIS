@@ -50,7 +50,7 @@ class Condition(BaseModel):
     text: str = Field(min_length=1, max_length=500)
     region: str = "all"
     weight: float = Field(default=1.0, gt=0, le=10)
-    stage: int = Field(default=1, ge=1, le=2)
+    stage: int = Field(default=1, ge=1, le=5)
     variants: list[str] | None = None
 
 
@@ -88,7 +88,9 @@ class DresSubmitRequest(BaseModel):
 class Encoder:
     def __init__(self) -> None:
         import open_clip
+        import threading
 
+        self._lock = threading.Lock()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model, _, _ = open_clip.create_model_and_transforms("ViT-B-16", pretrained="laion2b_s34b_b88k")
         self.model = self.model.to(self.device).eval()
@@ -96,11 +98,12 @@ class Encoder:
 
     @torch.inference_mode()
     def text(self, text: str) -> list[float]:
-        tokens = self.tokenizer([text]).to(self.device)
-        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.device.type == "cuda"):
-            value = self.model.encode_text(tokens)
-        value = value / value.norm(dim=-1, keepdim=True)
-        return value.float().cpu().numpy()[0].tolist()
+        with self._lock:
+            tokens = self.tokenizer([text]).to(self.device)
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.device.type == "cuda"):
+                value = self.model.encode_text(tokens)
+            value = value / value.norm(dim=-1, keepdim=True)
+            return value.float().cpu().numpy()[0].tolist()
 
 
 @lru_cache
