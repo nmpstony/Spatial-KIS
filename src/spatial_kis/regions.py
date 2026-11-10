@@ -7,9 +7,9 @@ from PIL import Image
 
 REGION_NAMES = (
     "all",
-    "top_left", "top", "top_right",
-    "left", "center", "right",
-    "bottom_left", "bottom", "bottom_right",
+    "top_left", "top_center", "top_right",
+    "middle_left", "center", "middle_right",
+    "bottom_left", "bottom_center", "bottom_right",
 )
 
 REGION_GROUPS = {
@@ -19,12 +19,16 @@ REGION_GROUPS = {
     "right": (3, 6, 9),
     "top": (1, 2, 3),
     "bottom": (7, 8, 9),
+    "middle_row": (4, 5, 6),
+    "center_col": (2, 5, 8),
     "center": (5,),
     "top_left": (1,),
-    "top": (2,),
+    "top_center": (2,),
     "top_right": (3,),
+    "middle_left": (4,),
+    "middle_right": (6,),
     "bottom_left": (7,),
-    "bottom": (8,),
+    "bottom_center": (8,),
     "bottom_right": (9,),
 }
 

@@ -5,9 +5,15 @@ const regionDefs = [
   { id: "right", label: "right (Bên phải: cột 3, 6, 9)" },
   { id: "top", label: "top (Phía trên: hàng 1, 2, 3)" },
   { id: "bottom", label: "bottom (Phía dưới: hàng 7, 8, 9)" },
+  { id: "middle_row", label: "middle_row (Hàng giữa: ô 4, 5, 6)" },
+  { id: "center_col", label: "center_col (Cột giữa: ô 2, 5, 8)" },
   { id: "top_left", label: "top_left (Góc trên trái: ô 1)" },
+  { id: "top_center", label: "top_center (Giữa trên: ô 2)" },
   { id: "top_right", label: "top_right (Góc trên phải: ô 3)" },
+  { id: "middle_left", label: "middle_left (Giữa trái: ô 4)" },
+  { id: "middle_right", label: "middle_right (Giữa phải: ô 6)" },
   { id: "bottom_left", label: "bottom_left (Góc dưới trái: ô 7)" },
+  { id: "bottom_center", label: "bottom_center (Giữa dưới: ô 8)" },
   { id: "bottom_right", label: "bottom_right (Góc dưới phải: ô 9)" }
 ];
 
@@ -15,7 +21,248 @@ const box = document.querySelector('#conditions'),
       results = document.querySelector('#results'),
       status = document.querySelector('#status'),
       inspect = document.querySelector('#inspect'),
-      player = document.querySelector('#player');
+      player = document.querySelector('#player'),
+      dresStatus = document.querySelector('#dres-status');
+
+let currentInspectItem = null;
+const submittedKeys = new Set();
+
+function cleanVideoStem(videoId) {
+  if (!videoId) return '';
+  const base = videoId.split('/').pop().split('\\').pop();
+  return base.replace(/\.mp4$/i, '');
+}
+
+async function checkServerHealth() {
+  const badge = document.querySelector('#backend-badge');
+  try {
+    const res = await fetch('/health');
+    if (res.ok) {
+      const data = await res.json();
+      badge.textContent = `● Server Ready (${data.backend || 'active'})`;
+      badge.style.color = '#7ee787';
+    } else {
+      badge.textContent = '⚠ Lỗi kết nối Server';
+      badge.style.color = '#ff7b72';
+    }
+  } catch (err) {
+    badge.textContent = '⚠ Offline';
+    badge.style.color = '#ff7b72';
+  }
+}
+checkServerHealth();
+
+// --- DRES State & Persistence ---
+const dresUrlInput = document.querySelector('#dres-url'),
+      dresUserInput = document.querySelector('#dres-user'),
+      dresPassInput = document.querySelector('#dres-pass'),
+      dresSessionInput = document.querySelector('#dres-session'),
+      dresEvalSelect = document.querySelector('#dres-eval-select'),
+      dresEvalIdInput = document.querySelector('#dres-eval-id'),
+      qaAnswerInput = document.querySelector('#qa-answer');
+
+function loadDresStorage() {
+  if (localStorage.getItem('dres_url')) dresUrlInput.value = localStorage.getItem('dres_url');
+  if (localStorage.getItem('dres_user')) dresUserInput.value = localStorage.getItem('dres_user');
+  if (localStorage.getItem('dres_session')) dresSessionInput.value = localStorage.getItem('dres_session');
+  if (localStorage.getItem('dres_eval_id')) dresEvalIdInput.value = localStorage.getItem('dres_eval_id');
+  if (dresSessionInput.value && dresEvalIdInput.value) {
+    dresStatus.textContent = `✅ Đã nạp phiên DRES: session=${dresSessionInput.value.slice(0, 10)}... | eval=${dresEvalIdInput.value}`;
+    dresStatus.style.color = '#7ee787';
+  }
+}
+
+function saveDresStorage() {
+  localStorage.setItem('dres_url', dresUrlInput.value.trim());
+  localStorage.setItem('dres_user', dresUserInput.value.trim());
+  localStorage.setItem('dres_session', dresSessionInput.value.trim());
+  localStorage.setItem('dres_eval_id', dresEvalIdInput.value.trim());
+}
+
+[dresUrlInput, dresUserInput, dresSessionInput, dresEvalIdInput].forEach(el => {
+  if (el) el.addEventListener('change', saveDresStorage);
+});
+
+if (dresEvalSelect) {
+  dresEvalSelect.addEventListener('change', () => {
+    if (dresEvalSelect.value) {
+      dresEvalIdInput.value = dresEvalSelect.value;
+      saveDresStorage();
+    }
+  });
+}
+
+function populateEvalDropdown(evaluations) {
+  if (!Array.isArray(evaluations) || !evaluations.length) return;
+  dresEvalSelect.innerHTML = '<option value="">-- Chọn cuộc thi --</option>' +
+    evaluations.map(ev => `<option value="${ev.id}">${ev.name || ev.id} (${ev.status || ''})</option>`).join('');
+  const active = evaluations.find(ev => ev.status === 'ACTIVE') || evaluations[0];
+  if (active && active.id) {
+    dresEvalSelect.value = active.id;
+    dresEvalIdInput.value = active.id;
+    saveDresStorage();
+  }
+}
+
+document.querySelector('#dres-login-btn').onclick = async () => {
+  const base_url = dresUrlInput.value.trim() || 'https://eventretrieval.one';
+  const username = dresUserInput.value.trim();
+  const password = dresPassInput.value;
+  if (!username || !password) {
+    dresStatus.textContent = '⚠ Vui lòng nhập Username và Password DRES!';
+    dresStatus.style.color = '#ff7b72';
+    return;
+  }
+  dresStatus.textContent = '⏳ Đang đăng nhập vào DRES...';
+  try {
+    let sessionId = null;
+    let evaluations = [];
+    // Try backend proxy first, fallback to direct browser fetch
+    const r = await fetch('/api/dres/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ base_url, username, password })
+    });
+    if (r.ok) {
+      const data = await r.json();
+      sessionId = data.sessionId;
+      evaluations = data.evaluations || [];
+    } else {
+      const directRes = await fetch(`${base_url.replace(/\/$/, '')}/api/v2/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password })
+      });
+      if (!directRes.ok) throw new Error(`HTTP ${directRes.status}`);
+      const directData = await directRes.json();
+      sessionId = directData.sessionId;
+      const evRes = await fetch(`${base_url.replace(/\/$/, '')}/api/v2/client/evaluation/list?session=${encodeURIComponent(sessionId)}`);
+      if (evRes.ok) evaluations = await evRes.json();
+    }
+    if (sessionId) {
+      dresSessionInput.value = sessionId;
+      populateEvalDropdown(evaluations);
+      saveDresStorage();
+      dresStatus.textContent = `✅ Đăng nhập DRES thành công! Session: ${sessionId} | Evaluation: ${dresEvalIdInput.value || 'chưa có'}`;
+      dresStatus.style.color = '#7ee787';
+    }
+  } catch (err) {
+    dresStatus.textContent = `❌ Lỗi đăng nhập DRES: ${err.message}`;
+    dresStatus.style.color = '#ff7b72';
+  }
+};
+
+document.querySelector('#dres-refresh-eval').onclick = async () => {
+  const base_url = dresUrlInput.value.trim() || 'https://eventretrieval.one';
+  const session_id = dresSessionInput.value.trim();
+  if (!session_id) {
+    dresStatus.textContent = '⚠ Cần có Session ID trước khi lấy danh sách Evaluation.';
+    return;
+  }
+  try {
+    let evaluations = [];
+    const r = await fetch(`/api/dres/evaluations?base_url=${encodeURIComponent(base_url)}&session_id=${encodeURIComponent(session_id)}`);
+    if (r.ok) {
+      const data = await r.json();
+      evaluations = data.evaluations || [];
+    } else {
+      const direct = await fetch(`${base_url.replace(/\/$/, '')}/api/v2/client/evaluation/list?session=${encodeURIComponent(session_id)}`);
+      if (direct.ok) evaluations = await direct.json();
+    }
+    populateEvalDropdown(evaluations);
+    dresStatus.textContent = `✅ Đã tải ${evaluations.length} evaluation(s). Active ID: ${dresEvalIdInput.value}`;
+    dresStatus.style.color = '#7ee787';
+  } catch (err) {
+    dresStatus.textContent = `❌ Không lấy được Evaluation: ${err.message}`;
+    dresStatus.style.color = '#ff7b72';
+  }
+};
+
+loadDresStorage();
+
+async function submitToDres(videoId, timeMs, mode = 'kis', cardEl = null) {
+  const base_url = (dresUrlInput.value.trim() || 'https://eventretrieval.one').replace(/\/$/, '');
+  const session_id = dresSessionInput.value.trim();
+  const evaluation_id = dresEvalIdInput.value.trim();
+  const videoStem = cleanVideoStem(videoId);
+  const ms = Math.max(0, Math.round(Number(timeMs) || 0));
+  const qa_answer = qaAnswerInput.value.trim();
+
+  if (mode === 'qa' && !qa_answer) {
+    alert('Bạn đang bấm Nộp Q&A nhưng chưa nhập "Đáp án Q&A" ở thanh trên cùng!');
+    qaAnswerInput.focus();
+    return;
+  }
+
+  const dedupKey = `${mode}:${videoStem}:${Math.round(ms / 500)}:${qa_answer}`;
+  if (submittedKeys.has(dedupKey)) {
+    if (!confirm(`CẢNH BÁO: Bạn vừa nộp ${videoStem} tại ~${ms}ms rồi! Thể lệ cấm nộp trùng kết quả. Bạn có chắc muốn gửi lại không?`)) {
+      return;
+    }
+  }
+
+  const labelPreview = mode === 'qa'
+    ? `Q&A: "${qa_answer}-${videoStem}-${ms}"`
+    : `KIS: mediaItemName="${videoStem}", start=${ms}, end=${ms}`;
+
+  if (!session_id || !evaluation_id) {
+    await navigator.clipboard.writeText(mode === 'qa' ? `${qa_answer}-${videoStem}-${ms}` : `${videoStem}\t${ms}`);
+    dresStatus.textContent = `📋 Chưa điền Session/Evaluation ID DRES — Đã tự động COPY vào bộ nhớ tạm: ${labelPreview}`;
+    dresStatus.style.color = '#ffd33d';
+    return;
+  }
+
+  dresStatus.textContent = `⏳ Đang nộp ${labelPreview}...`;
+  try {
+    let ok = false;
+    let respData = null;
+    const r = await fetch('/api/dres/submit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        base_url,
+        session_id,
+        evaluation_id,
+        mode,
+        video_id: videoStem,
+        start_ms: ms,
+        end_ms: ms,
+        qa_answer
+      })
+    });
+    if (r.ok) {
+      ok = true;
+      respData = await r.json();
+    } else {
+      // Fallback direct from browser in case server has no outbound internet
+      const body = mode === 'qa'
+        ? { answerSets: [{ answers: [{ text: `${qa_answer}-${videoStem}-${ms}` }] }] }
+        : { answerSets: [{ answers: [{ mediaItemName: videoStem, start: ms, end: ms }] }] };
+      const directRes = await fetch(
+        `${base_url}/api/v2/submit/${encodeURIComponent(evaluation_id)}?session=${encodeURIComponent(session_id)}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        }
+      );
+      respData = await directRes.json().catch(() => ({}));
+      if (!directRes.ok) throw new Error(JSON.stringify(respData));
+      ok = true;
+    }
+
+    if (ok) {
+      submittedKeys.add(dedupKey);
+      if (cardEl) cardEl.classList.add('submitted');
+      const dresMsg = respData && respData.dres_response ? JSON.stringify(respData.dres_response) : JSON.stringify(respData);
+      dresStatus.textContent = `🎉 ĐÃ NỘP THÀNH CÔNG (${labelPreview}) → Phản hồi DRES: ${dresMsg}`;
+      dresStatus.style.color = '#7ee787';
+    }
+  } catch (err) {
+    dresStatus.textContent = `❌ Lỗi khi nộp (${labelPreview}): ${err.message}`;
+    dresStatus.style.color = '#ff7b72';
+  }
+}
 
 function closeInspect() {
   if (player) {
@@ -28,6 +275,43 @@ function closeInspect() {
   }
 }
 
+function stepVideo(deltaSeconds) {
+  if (!player) return;
+  player.pause();
+  player.currentTime = Math.max(0, (player.currentTime || 0) + deltaSeconds);
+  updateLiveTelemetry();
+}
+
+function updateLiveTelemetry() {
+  if (!player || !currentInspectItem) return;
+  const details = document.querySelector('#details');
+  const fps = currentInspectItem.fps || 25.0;
+  const curSec = player.currentTime || currentInspectItem.timestamp || 0;
+  const curMs = Math.round(curSec * 1000);
+  const curFrame = Math.round(curSec * fps);
+  const stem = cleanVideoStem(currentInspectItem.video_id);
+  const qaVal = qaAnswerInput.value.trim();
+
+  if (details) {
+    details.innerHTML =
+      `Video: <b style="color:#ffdf5d">${stem}</b> &nbsp;|&nbsp; ` +
+      `Mốc hiện tại: <b style="color:#7ee787; font-size:15px;">${curMs} ms</b> (${curSec.toFixed(2)}s) &nbsp;|&nbsp; ` +
+      `Frame ước tính: <b>#${curFrame}</b> (FPS: ${fps})` +
+      (qaVal ? ` &nbsp;|&nbsp; Chuỗi Q&A: <b style="color:#ffd33d">${qaVal}-${stem}-${curMs}</b>` : '');
+  }
+
+  const kisBtn = document.querySelector('#modal-submit-kis');
+  if (kisBtn) kisBtn.textContent = `🚀 Nộp KIS (${stem} @ ${curMs} ms)`;
+  const qaBtn = document.querySelector('#modal-submit-qa');
+  if (qaBtn) qaBtn.textContent = `❓ Nộp Q&A (${qaVal || '...'}-${stem}-${curMs})`;
+}
+
+if (player) {
+  ['timeupdate', 'seeking', 'seeked', 'pause', 'loadedmetadata'].forEach(ev => {
+    player.addEventListener(ev, updateLiveTelemetry);
+  });
+}
+
 if (inspect) {
   inspect.addEventListener('close', () => {
     if (player) {
@@ -36,101 +320,149 @@ if (inspect) {
       player.load();
     }
   });
-
   inspect.addEventListener('click', (e) => {
-    if (e.target === inspect) {
-      closeInspect();
-    }
+    if (e.target === inspect) closeInspect();
   });
 }
 
-function addCondition(target, value = { text: '', region: 'all', weight: 1, expanded: '' }) {
+document.querySelector('#modal-copy-btn').onclick = async () => {
+  if (!currentInspectItem) return;
+  const stem = cleanVideoStem(currentInspectItem.video_id);
+  const curMs = Math.round((player.currentTime || currentInspectItem.timestamp || 0) * 1000);
+  const qaVal = qaAnswerInput.value.trim();
+  const textToCopy = qaVal ? `${qaVal}-${stem}-${curMs}` : `${stem}\t${curMs}`;
+  await navigator.clipboard.writeText(textToCopy);
+  dresStatus.textContent = `📋 Đã copy vào bộ nhớ tạm: ${textToCopy}`;
+  dresStatus.style.color = '#7ee787';
+};
+
+document.querySelector('#modal-submit-kis').onclick = () => {
+  if (!currentInspectItem) return;
+  const curMs = Math.round((player.currentTime || currentInspectItem.timestamp || 0) * 1000);
+  submitToDres(currentInspectItem.video_id, curMs, 'kis');
+};
+
+document.querySelector('#modal-submit-qa').onclick = () => {
+  if (!currentInspectItem) return;
+  const curMs = Math.round((player.currentTime || currentInspectItem.timestamp || 0) * 1000);
+  submitToDres(currentInspectItem.video_id, curMs, 'qa');
+};
+
+function addCondition(target, value = { text: '', region: 'all', weight: 1, stage: 1, expanded: '' }) {
   const wrapper = document.createElement('div');
-  wrapper.className = 'condition-wrapper';
+  wrapper.className = 'condition-wrapper' + (value.stage === 2 ? ' stage-2' : '');
   wrapper.innerHTML = `
     <div class="condition">
-      <input class="query-text" aria-label="Mô tả" placeholder="Nhập mô tả (VD: xe hơi màu trắng, người đi bộ...)" value="${value.text}">
+      <select class="stage-select" title="Giai đoạn cảnh trong video">
+        <option value="1" ${value.stage !== 2 ? 'selected' : ''}>🎬 Cảnh 1 (Chính)</option>
+        <option value="2" ${value.stage === 2 ? 'selected' : ''}>⏩ Cảnh 2 (Tiếp theo)</option>
+      </select>
+      <input class="query-text" aria-label="Mô tả" placeholder="Nhập mô tả tiếng Việt hoặc tiếng Anh (Nhấn Enter để tìm ngay)..." value="${value.text}">
       <select class="region-select">
         ${regionDefs.map(x => `<option value="${x.id}" ${x.id === value.region ? 'selected' : ''}>${x.label}</option>`).join('')}
       </select>
       <input class="weight-input" aria-label="Trọng số" type="number" min="0.1" max="10" step="0.1" value="${value.weight}" title="Trọng số (Weight)">
-      <button class="expand-btn" type="button" title="Dịch sang tiếng Anh / Mở rộng">🌐 Dịch / Làm giàu</button>
+      <button class="expand-btn" type="button" title="Dịch sang tiếng Anh / Mở rộng">🌐 Dịch EN</button>
       <button class="delete-btn" type="button" title="Xóa điều kiện">×</button>
     </div>
     <div class="expanded-row">
-      <span class="expanded-label">✨ Query sau khi làm giàu (EN):</span>
-      <input class="expanded-input" placeholder="Query tiếng Anh dùng để tìm kiếm (tự động dịch khi bật tuỳ chọn hoặc bấm nút bên trên)..." value="${value.expanded}">
+      <span class="expanded-label">✨ Query EN (có thể sửa tay):</span>
+      <input class="expanded-input" placeholder="Để trống hệ thống sẽ tự dịch sang tiếng Anh khi tìm kiếm, hoặc nhập trực tiếp tiếng Anh..." value="${value.expanded}">
     </div>
   `;
 
+  const stageSelect = wrapper.querySelector('.stage-select');
   const queryInput = wrapper.querySelector('.query-text');
   const expandedInput = wrapper.querySelector('.expanded-input');
   const expandBtn = wrapper.querySelector('.expand-btn');
   const deleteBtn = wrapper.querySelector('.delete-btn');
 
-  deleteBtn.onclick = () => wrapper.remove();
+  stageSelect.onchange = () => {
+    wrapper.classList.toggle('stage-2', Number(stageSelect.value) === 2);
+  };
+
+  deleteBtn.onclick = () => {
+    if (document.querySelectorAll('.condition-wrapper').length > 1) {
+      wrapper.remove();
+    } else {
+      queryInput.value = '';
+      expandedInput.value = '';
+    }
+  };
 
   async function triggerExpand() {
     const text = queryInput.value.trim();
     if (!text) return;
-    expandBtn.textContent = '⏳ Đang dịch...';
+    expandBtn.textContent = '⏳...';
     try {
       const res = await fetch('/api/expand', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: text })
+        body: JSON.stringify({ text })
       });
       if (res.ok) {
         const data = await res.json();
-        const english = (data.variants && data.variants.length > 1) ? data.variants[1] : (data.variants ? data.variants[0] : text);
+        const english = (data.variants && data.variants.length > 1) ? data.variants[data.variants.length - 1] : (data.variants ? data.variants[0] : text);
         expandedInput.value = english;
       }
     } catch (e) {
       console.error(e);
     } finally {
-      expandBtn.textContent = '🌐 Dịch / Làm giàu';
+      expandBtn.textContent = '🌐 Dịch EN';
     }
   }
 
   expandBtn.onclick = triggerExpand;
 
-  queryInput.addEventListener('change', () => {
-    const autoExpand = document.querySelector('#expand').checked;
-    if (autoExpand && queryInput.value.trim() && !expandedInput.value.trim()) {
-      triggerExpand();
-    }
+  // Clear stale translation if user edits the Vietnamese query
+  queryInput.addEventListener('input', () => {
+    expandedInput.dataset.auto = '';
+  });
+
+  // Press Enter to search immediately
+  [queryInput, expandedInput].forEach(inp => {
+    inp.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        runSearch();
+      }
+    });
   });
 
   target.append(wrapper);
+  queryInput.focus();
 }
 
 function getConditions(target) {
   return [...target.querySelectorAll('.condition-wrapper')].map(wrapper => {
+    const stage = Number(wrapper.querySelector('.stage-select').value) || 1;
     const text = wrapper.querySelector('.query-text').value.trim();
     const region = wrapper.querySelector('.region-select').value;
     const weight = Number(wrapper.querySelector('.weight-input').value) || 1.0;
     const expanded = wrapper.querySelector('.expanded-input').value.trim();
 
-    const variants = expanded ? [expanded] : (text ? [text] : []);
     return {
       text: text || expanded,
-      region: region,
-      weight: weight,
-      variants: variants.length ? variants : null
+      region,
+      weight,
+      stage,
+      variants: expanded ? [expanded] : null
     };
   }).filter(x => x.text);
 }
 
-document.querySelector('#add').onclick = () => addCondition(box);
+document.querySelector('#add').onclick = () => addCondition(box, { text: '', region: 'all', weight: 1, stage: 1, expanded: '' });
+document.querySelector('#add-temporal').onclick = () => addCondition(box, { text: '', region: 'all', weight: 1, stage: 2, expanded: '' });
 addCondition(box);
 
-document.querySelector('#search').onclick = async () => {
+async function runSearch() {
   const isAutoExpand = document.querySelector('#expand').checked;
   const isDiversify = document.querySelector('#diversify').checked;
+  const maxTemporalGap = Number(document.querySelector('#temporal-gap').value) || 25.0;
 
   if (isAutoExpand) {
     const wrappers = [...document.querySelectorAll('.condition-wrapper')];
-    for (const wrapper of wrappers) {
+    await Promise.all(wrappers.map(async (wrapper) => {
       const q = wrapper.querySelector('.query-text').value.trim();
       const exp = wrapper.querySelector('.expanded-input');
       if (q && !exp.value.trim()) {
@@ -142,27 +474,28 @@ document.querySelector('#search').onclick = async () => {
           });
           if (res.ok) {
             const data = await res.json();
-            const english = (data.variants && data.variants.length > 1) ? data.variants[1] : (data.variants ? data.variants[0] : q);
+            const english = (data.variants && data.variants.length > 1) ? data.variants[data.variants.length - 1] : (data.variants ? data.variants[0] : q);
             exp.value = english;
           }
         } catch (_) {}
       }
-    }
+    }));
   }
 
   const c = getConditions(box);
   if (!c.length) {
-    status.textContent = 'Vui lòng nhập ít nhất 1 điều kiện tìm kiếm.';
+    status.textContent = '⚠ Vui lòng nhập ít nhất 1 điều kiện tìm kiếm.';
     return;
   }
 
-  status.textContent = 'Đang tìm kiếm trên vector database...';
+  status.textContent = '⏳ Đang truy vấn trên 633,600 keyframes...';
   results.innerHTML = '';
 
   const request = {
     conditions: c,
     diversify: isDiversify,
-    expand: isAutoExpand
+    expand: isAutoExpand,
+    max_temporal_gap: maxTemporalGap
   };
 
   const t0 = performance.now();
@@ -173,75 +506,135 @@ document.querySelector('#search').onclick = async () => {
       body: JSON.stringify(request)
     });
     const lat = Math.round(performance.now() - t0);
-    const data = await r.json();
-
-    if (!r.ok) {
-      status.textContent = 'Lỗi: ' + (data.detail || JSON.stringify(data));
+    const textBody = await r.text();
+    let data = {};
+    try {
+      data = JSON.parse(textBody);
+    } catch (_) {
+      status.textContent = `❌ Lỗi máy chủ (${r.status}): ${textBody.slice(0, 140)}`;
       return;
     }
 
-    status.textContent = `Tìm thấy ${data.results.length} kết quả (${lat} ms)`;
+    if (!r.ok) {
+      status.textContent = '❌ Lỗi: ' + (data.detail || JSON.stringify(data));
+      return;
+    }
+
+    status.textContent = `✅ Hiển thị ${data.results.length} kết quả tốt nhất (${lat} ms)`;
+
+    const regionNames = {
+      0: "Toàn ảnh (all)", 1: "Top-Left (1)", 2: "Top-Center (2)", 3: "Top-Right (3)",
+      4: "Mid-Left (4)", 5: "Center (5)", 6: "Mid-Right (6)", 7: "Bot-Left (7)",
+      8: "Bot-Center (8)", 9: "Bot-Right (9)"
+    };
 
     for (const item of data.results) {
       const card = document.createElement('article');
       card.className = 'card';
 
-      const imgA = `/media/keyframe/${item.image_path.replace('images/', '')}`;
+      const imgA = `/media/keyframe/${item.image_path.replace(/^images\//, '')}`;
+      const stem = item.video_stem || cleanVideoStem(item.video_id);
+      const ms = item.timestamp_ms !== undefined ? item.timestamp_ms : Math.round((item.timestamp || 0) * 1000);
 
-      const regionNames = {
-        0: "Toàn ảnh (all)", 1: "Top-Left (ô 1)", 2: "Top (ô 2)", 3: "Top-Right (ô 3)",
-        4: "Left (ô 4)", 5: "Center (ô 5)", 6: "Right (ô 6)", 7: "Bottom-Left (ô 7)",
-        8: "Bottom (ô 8)", 9: "Bottom-Right (ô 9)"
-      };
-      const regionTag = `<span class="card-tag">Vùng khớp: <b>${regionNames[item.region_id] || item.region_id}</b></span>`;
+      const regionTag = `<span class="card-tag">Vùng: <b>${regionNames[item.region_id] || item.region_id}</b></span>`;
+      const nextTag = item.next_match
+        ? `<span class="card-tag next-tag">⏩ Cảnh 2 @ ${item.next_match.timestamp_ms}ms</span>`
+        : '';
 
       card.innerHTML = `
-        <img src="${imgA}" alt="${item.keyframe_id}" loading="lazy">
-        <div style="margin-top:6px;">${regionTag}</div>
-        <small>
-          <b>${item.video_id}</b> · ${item.timestamp.toFixed(2)}s · Score: <b>${item.score.toFixed(3)}</b>
-        </small>
-        <div style="margin-top:auto; display:flex; gap:6px; padding-top:8px;">
-          <button style="flex:1" class="view-btn">▶ Xem video</button>
-          <button title="Chính xác" class="fb-ok">✓</button>
-          <button title="Không liên quan" class="fb-no">×</button>
+        <img src="${imgA}" alt="${item.keyframe_id}" loading="lazy" title="Bấm để xem video và các frame lân cận">
+        <div class="card-meta">
+          <span class="video-pill">${stem}</span>
+          <span class="ms-pill">${ms} ms</span>
+        </div>
+        <div class="card-submeta">
+          <span>${item.timestamp.toFixed(2)}s</span>
+          <span>· #${item.frame_id}</span>
+          <span>· Score: <b>${item.score.toFixed(3)}</b></span>
+          ${regionTag}
+          ${nextTag}
+        </div>
+        <div class="card-actions">
+          <button type="button" class="view-btn">▶ Xem Video & Lân cận</button>
+          <button type="button" class="btn-secondary copy-btn" title="Copy mã Video + ms">📋</button>
+        </div>
+        <div class="card-submit-row">
+          <button type="button" class="btn-submit-kis kis-btn">🚀 Nộp KIS</button>
+          <button type="button" class="btn-submit-qa qa-btn">❓ Nộp Q&A</button>
         </div>
       `;
 
+      card.querySelector('img').onclick = () => inspectResult(item);
       card.querySelector('.view-btn').onclick = () => inspectResult(item);
-      card.querySelector('.fb-ok').onclick = () => feedback(item, 'correct');
-      card.querySelector('.fb-no').onclick = () => feedback(item, 'irrelevant');
+      card.querySelector('.copy-btn').onclick = async () => {
+        const qaVal = qaAnswerInput.value.trim();
+        const txt = qaVal ? `${qaVal}-${stem}-${ms}` : `${stem}\t${ms}`;
+        await navigator.clipboard.writeText(txt);
+        dresStatus.textContent = `📋 Đã copy: ${txt}`;
+        dresStatus.style.color = '#7ee787';
+      };
+      card.querySelector('.kis-btn').onclick = () => submitToDres(stem, ms, 'kis', card);
+      card.querySelector('.qa-btn').onclick = () => submitToDres(stem, ms, 'qa', card);
       results.append(card);
     }
   } catch (err) {
-    status.textContent = 'Lỗi kết nối máy chủ: ' + err.message;
+    status.textContent = '❌ Lỗi kết nối máy chủ: ' + err.message;
   }
-};
+}
 
-function inspectResult(item) {
+document.querySelector('#search').onclick = runSearch;
+
+async function inspectResult(item) {
   if (!player || !inspect) return;
+  currentInspectItem = item;
   player.pause();
   player.src = '/media/video/' + encodeURIComponent(item.video_id);
+  const startSec = Math.max(0, item.timestamp || 0);
   player.onloadedmetadata = () => {
-    player.currentTime = Math.max(0, (item.timestamp || 0) - 1.0);
-    player.play().catch(e => console.log('Autoplay:', e));
+    player.currentTime = startSec;
+    updateLiveTelemetry();
+    player.play().catch(() => {});
   };
   if (player.readyState >= 1) {
-    player.currentTime = Math.max(0, (item.timestamp || 0) - 1.0);
+    player.currentTime = startSec;
+    updateLiveTelemetry();
     player.play().catch(() => {});
   }
 
-  const details = document.querySelector('#details');
-  if (details) {
-    details.innerHTML = `<strong>Video:</strong> ${item.video_id} &nbsp;|&nbsp; <strong>Frame:</strong> ${item.frame_id} &nbsp;|&nbsp; <strong>Thời gian:</strong> ${item.timestamp.toFixed(2)}s &nbsp;|&nbsp; <strong>Score:</strong> ${item.score.toFixed(3)}`;
-  }
+  updateLiveTelemetry();
   inspect.showModal();
-}
 
-async function feedback(item, label) {
-  await fetch('/api/feedback', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ keyframe_id: item.keyframe_id, label })
-  });
+  // Load neighboring keyframes strip
+  const strip = document.querySelector('#neighbors-strip');
+  if (strip) {
+    strip.innerHTML = '<span style="color:#8b949e; font-size:12px;">Đang tải các frame lân cận...</span>';
+    try {
+      const r = await fetch(`/api/neighbors?video_id=${encodeURIComponent(item.video_id)}&timestamp=${item.timestamp}&window=35`);
+      if (r.ok) {
+        const data = await r.json();
+        strip.innerHTML = '';
+        for (const nb of (data.neighbors || [])) {
+          const div = document.createElement('div');
+          div.className = 'neighbor-item' + (nb.keyframe_id === item.keyframe_id ? ' active' : '');
+          const nbImg = `/media/keyframe/${nb.image_path.replace(/^images\//, '')}`;
+          const nbMs = nb.timestamp_ms !== undefined ? nb.timestamp_ms : Math.round(nb.timestamp * 1000);
+          div.innerHTML = `
+            <img src="${nbImg}" loading="lazy">
+            <div><b>${nbMs} ms</b></div>
+            <div style="color:#8b949e">${nb.timestamp.toFixed(1)}s · #${nb.frame_id}</div>
+          `;
+          div.onclick = () => {
+            currentInspectItem = { ...item, ...nb };
+            player.currentTime = nb.timestamp;
+            updateLiveTelemetry();
+            [...strip.querySelectorAll('.neighbor-item')].forEach(el => el.classList.remove('active'));
+            div.classList.add('active');
+          };
+          strip.append(div);
+        }
+      }
+    } catch (_) {
+      strip.innerHTML = '';
+    }
+  }
 }
