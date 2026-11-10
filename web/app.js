@@ -404,6 +404,7 @@ function addCondition(target, value = { text: '', region: 'all', weight: 1, stag
         const data = await res.json();
         const english = (data.variants && data.variants.length > 1) ? data.variants[data.variants.length - 1] : (data.variants ? data.variants[0] : text);
         expandedInput.value = english;
+        expandedInput.dataset.auto = 'true';
       }
     } catch (e) {
       console.error(e);
@@ -414,9 +415,14 @@ function addCondition(target, value = { text: '', region: 'all', weight: 1, stag
 
   expandBtn.onclick = triggerExpand;
 
-  // Clear stale translation if user edits the Vietnamese query
+  // Clear stale auto-translation if user edits the Vietnamese query
   queryInput.addEventListener('input', () => {
-    expandedInput.dataset.auto = '';
+    if (expandedInput.dataset.auto === 'true') {
+      expandedInput.value = '';
+    }
+  });
+  expandedInput.addEventListener('input', () => {
+    expandedInput.dataset.auto = 'manual';
   });
 
   // Press Enter to search immediately
@@ -476,6 +482,7 @@ async function runSearch() {
             const data = await res.json();
             const english = (data.variants && data.variants.length > 1) ? data.variants[data.variants.length - 1] : (data.variants ? data.variants[0] : q);
             exp.value = english;
+            exp.dataset.auto = 'true';
           }
         } catch (_) {}
       }
@@ -537,12 +544,22 @@ async function runSearch() {
       const ms = item.timestamp_ms !== undefined ? item.timestamp_ms : Math.round((item.timestamp || 0) * 1000);
 
       const regionTag = `<span class="card-tag">Vùng: <b>${regionNames[item.region_id] || item.region_id}</b></span>`;
-      const nextTag = item.next_match
-        ? `<span class="card-tag next-tag">⏩ Cảnh 2 @ ${item.next_match.timestamp_ms}ms</span>`
-        : '';
+      let nextTag = '';
+      let nextPreviewHtml = '';
+      if (item.next_match) {
+        const nextImg = `/media/keyframe/${item.next_match.image_path.replace(/^images\//, '')}`;
+        nextTag = `<span class="card-tag next-tag" title="Bấm để xem Cảnh 2">⏩ Cảnh 2 @ ${item.next_match.timestamp_ms}ms</span>`;
+        nextPreviewHtml = `
+          <div class="next-scene-box" title="Ảnh của Cảnh 2 tiếp theo tại ${item.next_match.timestamp_ms} ms">
+            <img src="${nextImg}" loading="lazy" style="aspect-ratio:16/9; width:100%; border-radius:4px; border:1px solid #8957e5; margin-top:4px;">
+            <div style="font-size:11px; color:#d2a8ff; text-align:center;">⏩ Cảnh 2: ${item.next_match.timestamp_ms} ms (#${item.next_match.frame_id})</div>
+          </div>
+        `;
+      }
 
       card.innerHTML = `
-        <img src="${imgA}" alt="${item.keyframe_id}" loading="lazy" title="Bấm để xem video và các frame lân cận">
+        <img src="${imgA}" alt="${item.keyframe_id}" loading="lazy" title="Cảnh 1 — Bấm để xem video và các frame lân cận">
+        ${nextPreviewHtml}
         <div class="card-meta">
           <span class="video-pill">${stem}</span>
           <span class="ms-pill">${ms} ms</span>
@@ -565,6 +582,13 @@ async function runSearch() {
       `;
 
       card.querySelector('img').onclick = () => inspectResult(item);
+      const nextBox = card.querySelector('.next-scene-box');
+      if (nextBox && item.next_match) {
+        nextBox.onclick = (e) => {
+          e.stopPropagation();
+          inspectResult({ ...item, ...item.next_match });
+        };
+      }
       card.querySelector('.view-btn').onclick = () => inspectResult(item);
       card.querySelector('.copy-btn').onclick = async () => {
         const qaVal = qaAnswerInput.value.trim();

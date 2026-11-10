@@ -195,32 +195,35 @@ class LocalMemmapIndex:
         matched_next_idx: dict[int, int] = {}
         if stage2:
             s2_combined, _, _ = combine_stage(stage2)
-            final_scores = s1_combined.copy()
-            # Temporal join per video: find max s2_combined[j] where 0 < t[j] - t[i] <= max_temporal_gap
-            for idxs in self.by_video.values():
-                if len(idxs) < 2:
-                    continue
-                # Avoid duplicate pass since by_video maps both video_id and video_stem
-                times = [self.records[i]["timestamp"] for i in idxs]
-                s2_vals = [float(s2_combined[i]) for i in idxs]
-                n_v = len(idxs)
-                for a in range(n_v):
-                    t_a = times[a]
-                    best_b = -1
-                    best_s2 = -1.0
-                    for b in range(a, n_v):
-                        dt = times[b] - t_a
-                        if dt > max_temporal_gap:
-                            break
-                        if dt >= 0.0 and s2_vals[b] > best_s2:
-                            best_s2 = s2_vals[b]
-                            best_b = idxs[b]
-                    if best_b >= 0:
-                        idx_a = idxs[a]
-                        final_scores[idx_a] = 2.0 / (1.0 / max(float(s1_combined[idx_a]), 1e-6) + 1.0 / max(best_s2, 1e-6))
-                        matched_next_idx[idx_a] = best_b
-                    else:
-                        final_scores[idxs[a]] *= 0.5
+            final_scores = np.zeros(self.count, dtype=np.float32)
+            # Only evaluate temporal window on top Stage-1 candidates for <20ms speed
+            cand_k = min(15000, self.count)
+            top_s1_indices = np.argpartition(s1_combined, -cand_k)[-cand_k:]
+            for idx_a in top_s1_indices:
+                idx_a_int = int(idx_a)
+                rec_a = self.records[idx_a_int]
+                stem = rec_a["video_stem"]
+                t_a = rec_a["timestamp"]
+                v_idxs = self.by_video.get(stem, [])
+                best_b = -1
+                best_s2 = -1.0
+                for idx_b in v_idxs:
+                    if idx_b == idx_a_int:
+                        continue
+                    dt = self.records[idx_b]["timestamp"] - t_a
+                    if dt > max_temporal_gap:
+                        break
+                    # Require strictly subsequent frame (at least 0.5s after Stage 1)
+                    if dt >= 0.5:
+                        val_s2 = float(s2_combined[idx_b])
+                        if val_s2 > best_s2:
+                            best_s2 = val_s2
+                            best_b = idx_b
+                if best_b >= 0:
+                    s1_val = max(float(s1_combined[idx_a_int]), 1e-6)
+                    s2_val = max(best_s2, 1e-6)
+                    final_scores[idx_a_int] = 2.0 / (1.0 / s1_val + 1.0 / s2_val)
+                    matched_next_idx[idx_a_int] = best_b
         else:
             final_scores = s1_combined
 
