@@ -47,8 +47,12 @@ class LocalExpander:
 
         self.model_name = model_name or os.getenv("SPATIAL_KIS_TRANSLATION_MODEL", "Helsinki-NLP/opus-mt-vi-en")
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-        self.model = AutoModelForSeq2SeqLM.from_pretrained(self.model_name).to(self.device).eval()
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(self.model_name, local_files_only=True)
+            self.model = AutoModelForSeq2SeqLM.from_pretrained(self.model_name, local_files_only=True).to(self.device).eval()
+        except Exception:
+            self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+            self.model = AutoModelForSeq2SeqLM.from_pretrained(self.model_name).to(self.device).eval()
 
     def translate(self, text: str) -> str:
         cleaned, has_cano = clean_vi_prompt(text)
