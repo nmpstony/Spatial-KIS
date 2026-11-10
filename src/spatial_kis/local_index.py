@@ -200,10 +200,12 @@ class LocalMemmapIndex:
             return combined, primary_regions, raw_scores_list
 
         s1_combined, s1_regions, s1_raw = combine_stage(stage1)
+        w1_total = sum(float(item[2]) for item in stage1)
 
         matched_next_idx: dict[int, int] = {}
         if stage2:
             s2_combined, _, _ = combine_stage(stage2)
+            w2_total = sum(float(item[2]) for item in stage2)
             final_scores = np.zeros(self.count, dtype=np.float32)
             # Symmetric candidate selection: include videos from top Stage-1 OR top Stage-2 hits
             cand_k = min(6000, self.count)
@@ -235,7 +237,7 @@ class LocalMemmapIndex:
                             best_b = v_idxs[b]
                     if best_b >= 0 and best_s2 >= 0.25:
                         idx_a = v_idxs[a]
-                        final_scores[idx_a] = 2.0 / (1.0 / s1_vals[a] + 1.0 / best_s2)
+                        final_scores[idx_a] = (w1_total + w2_total) / (w1_total / s1_vals[a] + w2_total / best_s2)
                         matched_next_idx[idx_a] = best_b
         else:
             final_scores = s1_combined

@@ -12,17 +12,18 @@ _FILLER_PREFIXES = re.compile(
     re.IGNORECASE,
 )
 
-# Vietnamese terms that MarianMT (opus-mt-vi-en) commonly mistranslates
+# Vietnamese terms that MarianMT (opus-mt-vi-en) commonly mistranslates (must remain pure Vietnamese here)
 _VI_PRE_REPLACEMENTS: list[tuple[re.Pattern, str]] = [
-    (re.compile(r"\b(cano|ca\s*nô|ca-nô)\b", re.IGNORECASE), "speedboat"),
-    (re.compile(r"\bflycam\b", re.IGNORECASE), "aerial view from above"),
+    (re.compile(r"\b(cano|ca\s*nô|ca-nô)\b", re.IGNORECASE), "thuyền cao tốc"),
+    (re.compile(r"\bflycam\b", re.IGNORECASE), "quay từ trên cao"),
     (re.compile(r"\b(mc|biên\s+tập\s+viên|btv)\b", re.IGNORECASE), "người dẫn chương trình truyền hình"),
     (re.compile(r"\báo\s+dài\b", re.IGNORECASE), "trang phục áo dài truyền thống"),
-    (re.compile(r"\bkhẩu\s+trang\b", re.IGNORECASE), "khẩu trang y tế che mặt"),
+    (re.compile(r"\bkhẩu\s+trang\b", re.IGNORECASE), "khẩu trang che mặt"),
 ]
 
 _EN_POST_REPLACEMENTS: list[tuple[re.Pattern, str]] = [
-    (re.compile(r"\bcane\b", re.IGNORECASE), "speedboat motorboat"),
+    (re.compile(r"\bspeedbolat\b", re.IGNORECASE), "speedboat"),
+    (re.compile(r"\bcane\b", re.IGNORECASE), "motorboat"),
     (re.compile(r"^there\s+is\s+a\s+scene\s+of\s+", re.IGNORECASE), ""),
     (re.compile(r"^there'?s\s+a\s+", re.IGNORECASE), "a "),
     (re.compile(r"^there\s+are\s+", re.IGNORECASE), ""),

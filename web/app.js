@@ -545,10 +545,12 @@ async function runSearch() {
 
       const regionTag = `<span class="card-tag">Vùng: <b>${regionNames[item.region_id] || item.region_id}</b></span>`;
       let nextTag = '';
+      let stage1LabelHtml = '';
       let nextPreviewHtml = '';
       if (item.next_match) {
         const nextImg = `/media/keyframe/${item.next_match.image_path.replace(/^images\//, '')}`;
         nextTag = `<span class="card-tag next-tag" title="Bấm để xem Cảnh 2">⏩ Cảnh 2 @ ${item.next_match.timestamp_ms}ms</span>`;
+        stage1LabelHtml = `<div style="font-size:11px; color:#79c0ff; text-align:center; margin-top:2px;">🎬 Cảnh 1: ${ms} ms (#${item.frame_id})</div>`;
         nextPreviewHtml = `
           <div class="next-scene-box" title="Ảnh của Cảnh 2 tiếp theo tại ${item.next_match.timestamp_ms} ms">
             <img src="${nextImg}" loading="lazy" style="aspect-ratio:16/9; width:100%; border-radius:4px; border:1px solid #8957e5; margin-top:4px;">
@@ -559,6 +561,7 @@ async function runSearch() {
 
       card.innerHTML = `
         <img src="${imgA}" alt="${item.keyframe_id}" loading="lazy" title="Cảnh 1 — Bấm để xem video và các frame lân cận">
+        ${stage1LabelHtml}
         ${nextPreviewHtml}
         <div class="card-meta">
           <span class="video-pill">${stem}</span>
