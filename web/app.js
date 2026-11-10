@@ -516,24 +516,37 @@ async function runSearch() {
 
   if (isAutoExpand) {
     const wrappers = [...document.querySelectorAll('.condition-wrapper')];
-    for (const wrapper of wrappers) {
-      const q = wrapper.querySelector('.query-text').value.trim();
-      const exp = wrapper.querySelector('.expanded-input');
-      if (q && !exp.value.trim()) {
-        try {
-          const res = await fetch('/api/expand', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ text: q })
-          });
-          if (res.ok) {
-            const data = await res.json();
-            const english = (data.variants && data.variants.length > 1) ? data.variants[data.variants.length - 1] : (data.variants ? data.variants[0] : q);
-            exp.value = english;
-            exp.dataset.auto = 'true';
-          }
-        } catch (_) {}
-      }
+    const pending = wrappers.filter((w) => {
+      const q = w.querySelector('.query-text').value.trim();
+      const exp = w.querySelector('.expanded-input');
+      return q && !exp.value.trim();
+    });
+    if (pending.length) {
+      status.textContent = '⏳ Đang dịch sang tiếng Anh...';
+      await Promise.all(
+        pending.map(async (wrapper) => {
+          const q = wrapper.querySelector('.query-text').value.trim();
+          const exp = wrapper.querySelector('.expanded-input');
+          try {
+            const res = await fetch('/api/expand', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ text: q })
+            });
+            if (res.ok) {
+              const data = await res.json();
+              const english =
+                data.variants && data.variants.length > 1
+                  ? data.variants[data.variants.length - 1]
+                  : data.variants
+                    ? data.variants[0]
+                    : q;
+              exp.value = english;
+              exp.dataset.auto = 'true';
+            }
+          } catch (_) {}
+        })
+      );
     }
   }
 

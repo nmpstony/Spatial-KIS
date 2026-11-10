@@ -162,10 +162,45 @@ class LocalMemmapIndex:
         Each item in evaluated_conditions is: (region_ids_tuple, query_vectors, weight, stage).
         stage=1: primary scene; stage=2: subsequent scene within max_temporal_gap seconds in the same video.
         """
-        stage1 = [item for item in evaluated_conditions if item[3] <= 1]
-        stage2 = [item for item in evaluated_conditions if item[3] >= 2]
-        if not stage1:
-            stage1, stage2 = stage2, []
+        # Pre-batch all matrix multiplications by region_id so each 1.3GB region tensor is scanned only ONCE per search
+        region_queries: dict[int, list[list[float]]] = defaultdict(list)
+        cond_region_slices: list[dict[int, tuple[int, int]]] = []
+        for regions_tuple, q_vecs, _, _ in evaluated_conditions:
+            slices_for_cond: dict[int, tuple[int, int]] = {}
+            for reg in regions_tuple:
+                start_col = len(region_queries[reg])
+                region_queries[reg].extend(q_vecs)
+                slices_for_cond[reg] = (start_col, len(region_queries[reg]))
+            cond_region_slices.append(slices_for_cond)
+
+        region_score_matrices: dict[int, torch.Tensor] = {}
+        with torch.no_grad():
+            for reg, q_list in region_queries.items():
+                q_tensor = torch.tensor(q_list, dtype=torch.float32).T  # [dim, M]
+                mat = self._region_tensor_fp32(reg)  # [N, dim]
+                region_score_matrices[reg] = torch.matmul(mat, q_tensor)  # [N, M]
+
+        def eval_single_cond(cond_idx: int) -> tuple[np.ndarray, np.ndarray]:
+            slices_for_cond = cond_region_slices[cond_idx]
+            best_scores: np.ndarray | None = None
+            best_regions: np.ndarray | None = None
+            for reg, (c0, c1) in slices_for_cond.items():
+                sub = region_score_matrices[reg][:, c0:c1]
+                reg_scores = sub[:, 0].numpy() if (c1 - c0) == 1 else sub.max(dim=1).values.numpy()
+                if best_scores is None:
+                    best_scores = reg_scores.copy()
+                    best_regions = np.full(self.count, reg, dtype=np.int8)
+                else:
+                    mask = reg_scores > best_scores
+                    best_scores[mask] = reg_scores[mask]
+                    best_regions[mask] = reg
+            assert best_scores is not None and best_regions is not None
+            return best_scores, best_regions
+
+        stage1_indices = [i for i, item in enumerate(evaluated_conditions) if item[3] <= 1]
+        stage2_indices = [i for i, item in enumerate(evaluated_conditions) if item[3] >= 2]
+        if not stage1_indices:
+            stage1_indices, stage2_indices = stage2_indices, []
 
         def normalize_distribution(scores: np.ndarray) -> np.ndarray:
             if self.count < 16:
@@ -176,20 +211,21 @@ class LocalMemmapIndex:
                 return np.clip((scores + 1.0) * 0.5, 1e-6, 1.0)
             return np.clip((scores - mean_val) / span, 1e-6, 1.0)
 
-        def combine_stage(conds: list[tuple[tuple[int, ...], list[list[float]], float, int]]) -> tuple[np.ndarray, np.ndarray, list[np.ndarray]]:
+        def combine_stage(cond_idxs: list[int]) -> tuple[np.ndarray, np.ndarray, list[np.ndarray]]:
             raw_scores_list: list[np.ndarray] = []
             norm_scores_list: list[np.ndarray] = []
             weights: list[float] = []
             primary_regions: np.ndarray | None = None
-            for regions_tuple, q_vecs, weight, _ in conds:
-                scores, regs = self.score_condition(regions_tuple, q_vecs)
+            for c_idx in cond_idxs:
+                weight = evaluated_conditions[c_idx][2]
+                scores, regs = eval_single_cond(c_idx)
                 raw_scores_list.append(scores)
                 norm_scores_list.append(normalize_distribution(scores))
                 weights.append(float(weight))
                 if primary_regions is None:
                     primary_regions = regs
             assert primary_regions is not None
-            if len(conds) == 1:
+            if len(cond_idxs) == 1:
                 combined = norm_scores_list[0]
             else:
                 w_sum = sum(weights)
@@ -199,13 +235,13 @@ class LocalMemmapIndex:
                 combined = w_sum / denom
             return combined, primary_regions, raw_scores_list
 
-        s1_combined, s1_regions, s1_raw = combine_stage(stage1)
-        w1_total = sum(float(item[2]) for item in stage1)
+        s1_combined, s1_regions, s1_raw = combine_stage(stage1_indices)
+        w1_total = sum(float(evaluated_conditions[i][2]) for i in stage1_indices)
 
         matched_next_idx: dict[int, int] = {}
-        if stage2:
-            s2_combined, _, _ = combine_stage(stage2)
-            w2_total = sum(float(item[2]) for item in stage2)
+        if stage2_indices:
+            s2_combined, _, _ = combine_stage(stage2_indices)
+            w2_total = sum(float(evaluated_conditions[i][2]) for i in stage2_indices)
             final_scores = np.zeros(self.count, dtype=np.float32)
             # Symmetric candidate selection: include videos from top Stage-1 OR top Stage-2 hits
             cand_k = min(6000, self.count)

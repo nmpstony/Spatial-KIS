@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import re
 import threading
+from functools import lru_cache
 import torch
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
@@ -55,12 +56,13 @@ class LocalExpander:
             self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
             self.model = AutoModelForSeq2SeqLM.from_pretrained(self.model_name).to(self.device).eval()
 
+    @lru_cache(maxsize=1024)
     def translate(self, text: str) -> str:
         cleaned, has_cano = clean_vi_prompt(text)
         with self._lock:
             tokens = self.tokenizer([cleaned], return_tensors="pt", truncation=True).to(self.device)
             with torch.no_grad():
-                generated = self.model.generate(**tokens, max_new_tokens=64)
+                generated = self.model.generate(**tokens, max_new_tokens=48, num_beams=1, do_sample=False)
             translated = self.tokenizer.decode(generated[0], skip_special_tokens=True).strip()
         translated = re.sub(r"[.!?]+$", "", translated).strip()
         for pattern, repl in _EN_POST_REPLACEMENTS:

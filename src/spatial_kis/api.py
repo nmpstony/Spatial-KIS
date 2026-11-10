@@ -91,6 +91,7 @@ class Encoder:
         import threading
 
         self._lock = threading.Lock()
+        self._cache: dict[str, list[float]] = {}
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model, _, _ = open_clip.create_model_and_transforms("ViT-B-16", pretrained="laion2b_s34b_b88k")
         self.model = self.model.to(self.device).eval()
@@ -98,12 +99,30 @@ class Encoder:
 
     @torch.inference_mode()
     def text(self, text: str) -> list[float]:
-        with self._lock:
-            tokens = self.tokenizer([text]).to(self.device)
-            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.device.type == "cuda"):
-                value = self.model.encode_text(tokens)
-            value = value / value.norm(dim=-1, keepdim=True)
-            return value.float().cpu().numpy()[0].tolist()
+        key = text.strip()
+        cached = self._cache.get(key)
+        if cached is not None:
+            return cached
+        return self.texts([key])[0]
+
+    @torch.inference_mode()
+    def texts(self, items: list[str]) -> list[list[float]]:
+        keys = [t.strip() for t in items]
+        missing = [k for k in dict.fromkeys(keys) if k not in self._cache]
+        if missing:
+            with self._lock:
+                still_missing = [k for k in missing if k not in self._cache]
+                if still_missing:
+                    tokens = self.tokenizer(still_missing).to(self.device)
+                    with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.device.type == "cuda"):
+                        values = self.model.encode_text(tokens)
+                    values = values / values.norm(dim=-1, keepdim=True)
+                    arr = values.float().cpu().numpy()
+                    for k, vec in zip(still_missing, arr):
+                        if len(self._cache) >= 2048:
+                            self._cache.clear()
+                        self._cache[k] = vec.tolist()
+        return [self._cache[k] for k in keys]
 
 
 @lru_cache
@@ -149,13 +168,13 @@ def resolve_condition_texts(condition: Condition, expand: bool) -> list[str]:
     if condition.variants:
         cleaned = [v.strip() for v in condition.variants if v and v.strip()]
         if cleaned and not (expand and len(cleaned) == 1 and cleaned[0] == condition.text.strip()):
-            return cleaned[:3]
+            return cleaned[:2]
     if expand:
         expanded = variants(condition.text)
-        # Prioritize English translation for OpenCLIP while keeping original if distinct
+        # Use the English translation directly for OpenCLIP when available
         if len(expanded) > 1:
-            return list(dict.fromkeys([expanded[-1], *expanded]))[:3]
-        return expanded[:3]
+            return [expanded[-1]]
+        return expanded[:1]
     return [condition.text.strip()]
 
 
@@ -208,10 +227,13 @@ def run_conditions(conditions: list[Condition], top_k: int, expand: bool) -> lis
 def search(request: SearchRequest) -> dict:
     if use_local_engine():
         engine = local_engine()
+        cond_texts = [resolve_condition_texts(cond, request.expand) for cond in request.conditions]
+        flat_texts = [t for sublist in cond_texts for t in sublist]
+        flat_vecs = encoder().texts(flat_texts)
+        vec_map = dict(zip(flat_texts, flat_vecs))
         evaluated: list[tuple[tuple[int, ...], list[list[float]], float, int]] = []
-        for cond in request.conditions:
-            texts = resolve_condition_texts(cond, request.expand)
-            q_vecs = [encoder().text(t) for t in texts]
+        for cond, texts in zip(request.conditions, cond_texts):
+            q_vecs = [vec_map[t] for t in texts]
             evaluated.append((region_ids(cond.region), q_vecs, cond.weight, cond.stage))
         return engine.search_conditions(
             evaluated_conditions=evaluated,
@@ -231,6 +253,24 @@ def search(request: SearchRequest) -> dict:
 
 app = FastAPI(title="Spatial KIS")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+
+@app.on_event("startup")
+def _warmup_models() -> None:
+    import threading
+    from .expander import expander as get_expander
+
+    def _bg() -> None:
+        try:
+            get_expander()
+            encoder()
+            if use_local_engine():
+                eng = local_engine()
+                eng._region_tensor_fp32(0)
+        except Exception:
+            pass
+
+    threading.Thread(target=_bg, daemon=True).start()
 
 
 @app.get("/health")
