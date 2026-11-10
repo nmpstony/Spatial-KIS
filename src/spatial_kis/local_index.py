@@ -205,34 +205,38 @@ class LocalMemmapIndex:
         if stage2:
             s2_combined, _, _ = combine_stage(stage2)
             final_scores = np.zeros(self.count, dtype=np.float32)
-            # Only evaluate temporal window on top Stage-1 candidates for <20ms speed
-            cand_k = min(15000, self.count)
-            top_s1_indices = np.argpartition(s1_combined, -cand_k)[-cand_k:]
-            for idx_a in top_s1_indices:
-                idx_a_int = int(idx_a)
-                rec_a = self.records[idx_a_int]
-                stem = rec_a["video_stem"]
-                t_a = rec_a["timestamp"]
+            # Symmetric candidate selection: include videos from top Stage-1 OR top Stage-2 hits
+            cand_k = min(6000, self.count)
+            top_s1 = np.argpartition(s1_combined, -cand_k)[-cand_k:]
+            top_s2 = np.argpartition(s2_combined, -cand_k)[-cand_k:]
+            cand_videos = {self.records[int(i)]["video_stem"] for i in top_s1} | {
+                self.records[int(i)]["video_stem"] for i in top_s2
+            }
+            for stem in cand_videos:
                 v_idxs = self.by_video.get(stem, [])
-                best_b = -1
-                best_s2 = -1.0
-                for idx_b in v_idxs:
-                    if idx_b == idx_a_int:
+                n_v = len(v_idxs)
+                if n_v < 2:
+                    continue
+                times = [self.records[i]["timestamp"] for i in v_idxs]
+                s1_vals = [float(s1_combined[i]) for i in v_idxs]
+                s2_vals = [float(s2_combined[i]) for i in v_idxs]
+                for a in range(n_v):
+                    if s1_vals[a] < 0.25:
                         continue
-                    dt = self.records[idx_b]["timestamp"] - t_a
-                    if dt > max_temporal_gap:
-                        break
-                    # Require strictly subsequent frame (at least 0.5s after Stage 1)
-                    if dt >= 0.5:
-                        val_s2 = float(s2_combined[idx_b])
-                        if val_s2 > best_s2:
-                            best_s2 = val_s2
-                            best_b = idx_b
-                if best_b >= 0:
-                    s1_val = max(float(s1_combined[idx_a_int]), 1e-6)
-                    s2_val = max(best_s2, 1e-6)
-                    final_scores[idx_a_int] = 2.0 / (1.0 / s1_val + 1.0 / s2_val)
-                    matched_next_idx[idx_a_int] = best_b
+                    t_a = times[a]
+                    best_b = -1
+                    best_s2 = -1.0
+                    for b in range(a + 1, n_v):
+                        dt = times[b] - t_a
+                        if dt > max_temporal_gap:
+                            break
+                        if dt >= 0.5 and s2_vals[b] > best_s2:
+                            best_s2 = s2_vals[b]
+                            best_b = v_idxs[b]
+                    if best_b >= 0 and best_s2 >= 0.25:
+                        idx_a = v_idxs[a]
+                        final_scores[idx_a] = 2.0 / (1.0 / s1_vals[a] + 1.0 / best_s2)
+                        matched_next_idx[idx_a] = best_b
         else:
             final_scores = s1_combined
 
