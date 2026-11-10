@@ -155,7 +155,7 @@ class LocalMemmapIndex:
         top_k: int,
         result_limit: int,
         diversify: bool,
-        max_temporal_gap: float = 25.0,
+        max_temporal_gap: float = 45.0,
     ) -> dict:
         """
         Full-corpus multi-condition & temporal search.
@@ -167,6 +167,15 @@ class LocalMemmapIndex:
         if not stage1:
             stage1, stage2 = stage2, []
 
+        def normalize_distribution(scores: np.ndarray) -> np.ndarray:
+            if self.count < 16:
+                return np.clip((scores + 1.0) * 0.5, 1e-6, 1.0)
+            mean_val = float(np.mean(scores))
+            span = float(np.max(scores)) - mean_val
+            if span <= 1e-6:
+                return np.clip((scores + 1.0) * 0.5, 1e-6, 1.0)
+            return np.clip((scores - mean_val) / span, 1e-6, 1.0)
+
         def combine_stage(conds: list[tuple[tuple[int, ...], list[list[float]], float, int]]) -> tuple[np.ndarray, np.ndarray, list[np.ndarray]]:
             raw_scores_list: list[np.ndarray] = []
             norm_scores_list: list[np.ndarray] = []
@@ -175,7 +184,7 @@ class LocalMemmapIndex:
             for regions_tuple, q_vecs, weight, _ in conds:
                 scores, regs = self.score_condition(regions_tuple, q_vecs)
                 raw_scores_list.append(scores)
-                norm_scores_list.append(np.clip((scores + 1.0) * 0.5, 1e-6, 1.0))
+                norm_scores_list.append(normalize_distribution(scores))
                 weights.append(float(weight))
                 if primary_regions is None:
                     primary_regions = regs

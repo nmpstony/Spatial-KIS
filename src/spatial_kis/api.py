@@ -60,7 +60,7 @@ class SearchRequest(BaseModel):
     result_limit: int = Field(default=60, ge=1, le=200)
     diversify: bool = True
     expand: bool = True
-    max_temporal_gap: float = Field(default=25.0, ge=1.0, le=180.0)
+    max_temporal_gap: float = Field(default=45.0, ge=1.0, le=300.0)
 
 
 class Feedback(BaseModel):

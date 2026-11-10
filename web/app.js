@@ -464,7 +464,7 @@ addCondition(box);
 async function runSearch() {
   const isAutoExpand = document.querySelector('#expand').checked;
   const isDiversify = document.querySelector('#diversify').checked;
-  const maxTemporalGap = Number(document.querySelector('#temporal-gap').value) || 25.0;
+  const maxTemporalGap = Number(document.querySelector('#temporal-gap').value) || 45.0;
 
   if (isAutoExpand) {
     const wrappers = [...document.querySelectorAll('.condition-wrapper')];
