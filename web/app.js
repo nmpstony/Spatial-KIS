@@ -509,10 +509,167 @@ function getConditions() {
 document.querySelector('#add-scene').onclick = () => addSceneBox();
 addSceneBox();
 
-async function runSearch() {
+// --- CSV / OCR Search & Video Intersection ---
+const csvMetaBadge = document.querySelector('#csv-meta-badge');
+const csvFileInput = document.querySelector('#csv-file-input');
+const csvUploadBtn = document.querySelector('#csv-upload-btn');
+const csvQueryInput = document.querySelector('#csv-query-input');
+const csvSearchBtn = document.querySelector('#csv-search-btn');
+const useVideoFilterChk = document.querySelector('#use-video-filter');
+const videoFilterInput = document.querySelector('#video-filter-input');
+const filterL21L24Btn = document.querySelector('#filter-l21-l24-btn');
+const filterClearBtn = document.querySelector('#filter-clear-btn');
+const csvResultsBar = document.querySelector('#csv-results-bar');
+
+async function refreshCsvStatus() {
+  if (!csvMetaBadge) return;
+  try {
+    const r = await fetch('/api/csv/status');
+    if (!r.ok) return;
+    const data = await r.json();
+    if (data.total_rows > 0) {
+      const fNames = (data.files || []).map((f) => `${f.name} (${f.rows})`).join(', ');
+      csvMetaBadge.textContent = `✅ Đã nạp CSV: ${data.total_rows} dòng (${data.unique_videos} video) [${fNames}]`;
+      csvMetaBadge.style.color = '#7ee787';
+    } else {
+      csvMetaBadge.textContent = '⚠ Chưa có file .csv trên server (Bấm "📂 Nạp file .CSV" để tải lên)';
+      csvMetaBadge.style.color = '#ffd33d';
+    }
+  } catch (_) {}
+}
+refreshCsvStatus();
+
+if (csvUploadBtn && csvFileInput) {
+  csvUploadBtn.onclick = () => csvFileInput.click();
+  csvFileInput.onchange = async () => {
+    const file = csvFileInput.files && csvFileInput.files[0];
+    if (!file) return;
+    csvMetaBadge.textContent = `⏳ Đang tải ${file.name} lên server...`;
+    try {
+      const content = await file.text();
+      const r = await fetch('/api/csv/upload', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filename: file.name, content })
+      });
+      if (r.ok) {
+        await refreshCsvStatus();
+        if (csvQueryInput.value.trim()) {
+          await runCsvSearch(false);
+        }
+      } else {
+        csvMetaBadge.textContent = `❌ Lỗi nạp CSV (${r.status})`;
+        csvMetaBadge.style.color = '#ff7b72';
+      }
+    } catch (err) {
+      csvMetaBadge.textContent = `❌ Lỗi nạp CSV: ${err.message}`;
+      csvMetaBadge.style.color = '#ff7b72';
+    }
+  };
+}
+
+async function runCsvSearch(triggerVisualSearch = false) {
+  const q = csvQueryInput ? csvQueryInput.value.trim() : '';
+  if (!q) {
+    if (csvResultsBar) csvResultsBar.style.display = 'none';
+    return [];
+  }
+  try {
+    const r = await fetch('/api/csv/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: q, limit: 80 })
+    });
+    if (!r.ok) return [];
+    const data = await r.json();
+    const vids = data.video_ids || [];
+    if (videoFilterInput) {
+      videoFilterInput.value = vids.join(', ');
+    }
+    if (useVideoFilterChk && vids.length > 0) {
+      useVideoFilterChk.checked = true;
+    }
+    if (csvResultsBar) {
+      csvResultsBar.style.display = 'block';
+      if (data.total_rows === 0) {
+        csvResultsBar.innerHTML = `<span style="color:#ffd33d">⚠ Trên server chưa có dữ liệu CSV nào. Hãy bấm nút <b>📂 Nạp file .CSV lên Server</b> ở góc phải!</span>`;
+      } else if (vids.length === 0) {
+        csvResultsBar.innerHTML = `<span style="color:#ff7b72">❌ Không tìm thấy từ khóa <b>"${q}"</b> trong ${data.total_rows} dòng CSV. (Tạm tắt lọc giao để không bị trống kết quả)</span>`;
+        if (useVideoFilterChk) useVideoFilterChk.checked = false;
+      } else {
+        const chipsHtml = (data.matches || [])
+          .slice(0, 25)
+          .map((m, idx) => {
+            const tsLabel = m.timestamp != null ? ` @ ${Number(m.timestamp).toFixed(1)}s` : m.frame_id != null ? ` #${m.frame_id}` : '';
+            const safeText = (m.text || '').replace(/"/g, '&quot;');
+            return `<span class="csv-snippet-chip" data-idx="${idx}" title="${safeText}">🎬 ${m.video_id}${tsLabel}: ${m.text.slice(0, 48)}</span>`;
+          })
+          .join('');
+        csvResultsBar.innerHTML =
+          `<div style="margin-bottom:4px; color:#7ee787;">✅ Tìm thấy <b>${vids.length} mã video</b> khớp từ khóa <b>"${q}"</b> (Đã tự động điền vào ô Giao ∩ bên phải — Bấm vào chip bên dưới để xem ngay video):</div>` +
+          `<div>${chipsHtml}</div>`;
+        csvResultsBar.querySelectorAll('.csv-snippet-chip').forEach((chip) => {
+          chip.onclick = () => {
+            const m = data.matches[Number(chip.dataset.idx)];
+            if (m) {
+              inspectResult({
+                video_id: m.video_id,
+                video_stem: m.video_id,
+                frame_id: m.frame_id || 0,
+                timestamp: m.timestamp != null ? Number(m.timestamp) : 0,
+                timestamp_ms: m.timestamp != null ? Math.round(Number(m.timestamp) * 1000) : 0,
+                fps: 25.0,
+                score: 1.0
+              });
+            }
+          };
+        });
+      }
+    }
+    if (triggerVisualSearch && getConditions().length > 0) {
+      await runSearch(true);
+    }
+    return vids;
+  } catch (_) {
+    return [];
+  }
+}
+
+if (csvSearchBtn) {
+  csvSearchBtn.onclick = () => runCsvSearch(true);
+}
+if (csvQueryInput) {
+  csvQueryInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      runCsvSearch(true);
+    }
+  });
+}
+if (filterL21L24Btn) {
+  filterL21L24Btn.onclick = () => {
+    videoFilterInput.value = 'L21-L24';
+    useVideoFilterChk.checked = true;
+    if (getConditions().length > 0) runSearch(true);
+  };
+}
+if (filterClearBtn) {
+  filterClearBtn.onclick = () => {
+    videoFilterInput.value = '';
+    if (csvQueryInput) csvQueryInput.value = '';
+    if (csvResultsBar) csvResultsBar.style.display = 'none';
+    if (getConditions().length > 0) runSearch(true);
+  };
+}
+
+async function runSearch(skipAutoCsv = false) {
   const isAutoExpand = document.querySelector('#expand').checked;
   const isDiversify = document.querySelector('#diversify').checked;
   const maxTemporalGap = Number(document.querySelector('#temporal-gap').value) || 45.0;
+
+  if (!skipAutoCsv && csvQueryInput && csvQueryInput.value.trim() && videoFilterInput && !videoFilterInput.value.trim()) {
+    await runCsvSearch(false);
+  }
 
   if (isAutoExpand) {
     const wrappers = [...document.querySelectorAll('.condition-wrapper')];
@@ -559,11 +716,15 @@ async function runSearch() {
   status.textContent = '⏳ Đang truy vấn trên 633,600 keyframes...';
   results.innerHTML = '';
 
+  const activeFilterStr =
+    useVideoFilterChk && useVideoFilterChk.checked && videoFilterInput ? videoFilterInput.value.trim() : '';
+
   const request = {
     conditions: c,
     diversify: isDiversify,
     expand: isAutoExpand,
-    max_temporal_gap: maxTemporalGap
+    max_temporal_gap: maxTemporalGap,
+    video_filter: activeFilterStr ? [activeFilterStr] : null
   };
 
   const t0 = performance.now();

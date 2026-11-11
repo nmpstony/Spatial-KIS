@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field
 from pymilvus import MilvusClient
 
 from .expander import variants
-from .local_index import LocalMemmapIndex, clean_video_name
+from .local_index import CsvSearchEngine, LocalMemmapIndex, clean_video_name
 from .ranking import Hit, condition_best, conjunction, diversify_by_shot
 from .regions import region_ids
 
@@ -61,6 +61,17 @@ class SearchRequest(BaseModel):
     diversify: bool = True
     expand: bool = True
     max_temporal_gap: float = Field(default=45.0, ge=1.0, le=300.0)
+    video_filter: list[str] | None = None
+
+
+class CsvSearchRequest(BaseModel):
+    query: str = ""
+    limit: int = Field(default=80, ge=1, le=500)
+
+
+class CsvUploadRequest(BaseModel):
+    filename: str = "ocr.csv"
+    content: str
 
 
 class Feedback(BaseModel):
@@ -150,6 +161,11 @@ def local_engine() -> LocalMemmapIndex:
     return LocalMemmapIndex(ARTIFACT)
 
 
+@lru_cache
+def csv_engine() -> CsvSearchEngine:
+    return CsvSearchEngine(ARTIFACT)
+
+
 def use_local_engine() -> bool:
     if BACKEND_MODE == "local":
         return True
@@ -235,12 +251,14 @@ def search(request: SearchRequest) -> dict:
         for cond, texts in zip(request.conditions, cond_texts):
             q_vecs = [vec_map[t] for t in texts]
             evaluated.append((region_ids(cond.region), q_vecs, cond.weight, cond.stage))
+        allowed_vids = engine.resolve_allowed_videos(request.video_filter)
         return engine.search_conditions(
             evaluated_conditions=evaluated,
             top_k=request.top_k,
             result_limit=request.result_limit,
             diversify=request.diversify,
             max_temporal_gap=request.max_temporal_gap,
+            allowed_videos=allowed_vids,
         )
 
     first = conjunction(
@@ -307,6 +325,30 @@ def neighbors_endpoint(
 @app.post("/api/expand")
 def expand_endpoint(condition: Condition) -> dict:
     return {"original": condition.text, "variants": variants(condition.text)}
+
+
+@app.get("/api/csv/status")
+def csv_status_endpoint() -> dict:
+    return csv_engine().status()
+
+
+@app.post("/api/csv/search")
+def csv_search_endpoint(req: CsvSearchRequest) -> dict:
+    return csv_engine().search(req.query, limit=req.limit)
+
+
+@app.post("/api/csv/upload")
+def csv_upload_endpoint(req: CsvUploadRequest) -> dict:
+    import re
+
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", Path(req.filename).name)
+    if not safe_name.lower().endswith(".csv"):
+        safe_name += ".csv"
+    target = ARTIFACT / safe_name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(req.content, encoding="utf-8")
+    csv_engine().reload_if_needed(force=True)
+    return {"ok": True, "saved_as": safe_name, **csv_engine().status()}
 
 
 @app.post("/api/feedback")

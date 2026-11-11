@@ -163,6 +163,34 @@ class LocalMemmapIndex:
         assert best_scores is not None and best_regions is not None
         return best_scores, best_regions
 
+    def resolve_allowed_videos(self, raw_filters: list[str] | None) -> set[str] | None:
+        if not raw_filters:
+            return None
+        tokens: list[str] = []
+        for item in raw_filters:
+            for part in item.replace(";", ",").replace(" ", ",").split(","):
+                cleaned = clean_video_name(part.strip()).upper()
+                if not cleaned:
+                    continue
+                # Support range syntax like L21-L24
+                if "-" in cleaned and len(cleaned.split("-")) == 2:
+                    p1, p2 = cleaned.split("-")
+                    if len(p1) == 3 and len(p2) == 3 and p1[0] == p2[0] and p1[1:].isdigit() and p2[1:].isdigit():
+                        prefix = p1[0]
+                        for b_num in range(int(p1[1:]), int(p2[1:]) + 1):
+                            tokens.append(f"{prefix}{b_num:02d}")
+                        continue
+                tokens.append(cleaned)
+        if not tokens:
+            return None
+        allowed: set[str] = set()
+        for stem in self.by_video:
+            clean_st = clean_video_name(stem)
+            stem_up = clean_st.upper()
+            if any(stem_up == tok or stem_up.startswith(tok + "_") or stem_up.startswith(tok) for tok in tokens):
+                allowed.add(clean_st)
+        return allowed
+
     def search_conditions(
         self,
         evaluated_conditions: list[tuple[tuple[int, ...], list[list[float]], float, int]],
@@ -170,6 +198,7 @@ class LocalMemmapIndex:
         result_limit: int,
         diversify: bool,
         max_temporal_gap: float = 45.0,
+        allowed_videos: set[str] | None = None,
     ) -> dict:
         """
         Full-corpus multi-condition & temporal search.
@@ -259,18 +288,24 @@ class LocalMemmapIndex:
         num_stages = len(stage_groups)
         if num_stages >= 2:
             final_scores = np.zeros(self.count, dtype=np.float32)
-            cand_k = min(12000, self.count)
-            stage_video_sets: list[set[str]] = []
-            for st_comb, _, _ in stage_evals:
-                top_st = np.argpartition(st_comb, -cand_k)[-cand_k:]
-                stage_video_sets.append({self.records[int(i)]["video_stem"] for i in top_st})
-            cand_videos = set.intersection(*stage_video_sets) if stage_video_sets else set()
-            if not cand_videos and stage_video_sets:
-                cand_videos = set.union(*stage_video_sets)
+            if allowed_videos is not None:
+                cand_videos = set(allowed_videos)
+            else:
+                cand_k = min(12000, self.count)
+                stage_video_sets: list[set[str]] = []
+                for st_comb, _, _ in stage_evals:
+                    top_st = np.argpartition(st_comb, -cand_k)[-cand_k:]
+                    stage_video_sets.append({self.records[int(i)]["video_stem"] for i in top_st})
+                cand_videos = set.intersection(*stage_video_sets) if stage_video_sets else set()
+                if not cand_videos and stage_video_sets:
+                    cand_videos = set.union(*stage_video_sets)
 
             w_total_all = sum(stage_weights)
             inf = float("inf")
-            min_stage_norm = 0.32 if self.count >= 1000 else 0.15
+            if allowed_videos is not None and len(allowed_videos) <= 40:
+                min_stage_norm = 0.12
+            else:
+                min_stage_norm = 0.32 if self.count >= 1000 else 0.15
             for stem in cand_videos:
                 v_idxs = self.by_video.get(stem, [])
                 n_v = len(v_idxs)
@@ -327,7 +362,13 @@ class LocalMemmapIndex:
                         if chain:
                             matched_chains[idx_a] = chain
         else:
-            final_scores = s1_combined
+            if allowed_videos is not None:
+                final_scores = np.zeros(self.count, dtype=np.float32)
+                for stem in allowed_videos:
+                    for idx_a in self.by_video.get(stem, []):
+                        final_scores[idx_a] = s1_combined[idx_a]
+            else:
+                final_scores = s1_combined
 
         k = min(max(top_k, result_limit * 4), self.count)
         top_indices = np.argpartition(final_scores, -k)[-k:]
@@ -336,10 +377,15 @@ class LocalMemmapIndex:
         ranked: list[dict] = []
         for idx in top_indices:
             idx_int = int(idx)
+            sc = float(final_scores[idx_int])
+            if sc <= 0.0:
+                continue
             rec = self.records[idx_int]
+            if allowed_videos is not None and rec["video_stem"] not in allowed_videos:
+                continue
             entry = {
                 **rec,
-                "score": float(final_scores[idx_int]),
+                "score": sc,
                 "region_id": int(s1_regions[idx_int]),
                 "condition_scores": [float(arr[idx_int]) for arr in s1_raw],
             }
@@ -377,6 +423,193 @@ class LocalMemmapIndex:
             nearby.sort(key=lambda r: abs(r["timestamp"] - timestamp))
             nearby = sorted(nearby[:limit], key=lambda r: r["timestamp"])
         return nearby
+
+
+def strip_accents(text: str) -> str:
+    import unicodedata
+
+    text = text.replace("đ", "d").replace("Đ", "D")
+    nfd = unicodedata.normalize("NFD", text)
+    return "".join(ch for ch in nfd if unicodedata.category(ch) != "Mn").lower()
+
+
+class CsvSearchEngine:
+    """In-memory index over OCR / ASR / Metadata CSV files in the artifact directory."""
+
+    def __init__(self, artifact_root: Path) -> None:
+        self.artifact_root = Path(artifact_root)
+        self._mtimes: dict[str, float] = {}
+        self.rows: list[dict] = []
+        self.files_info: list[dict] = []
+        self.reload_if_needed()
+
+    def _discover_csv_files(self) -> list[Path]:
+        files: list[Path] = []
+        if self.artifact_root.is_dir():
+            files.extend(sorted(self.artifact_root.glob("*.csv")))
+            csv_sub = self.artifact_root / "csv"
+            if csv_sub.is_dir():
+                files.extend(sorted(csv_sub.glob("*.csv")))
+        return files
+
+    def reload_if_needed(self, force: bool = False) -> None:
+        import csv
+        import re
+
+        csv_files = self._discover_csv_files()
+        current_mtimes = {str(p): p.stat().st_mtime for p in csv_files if p.is_file()}
+        if not force and current_mtimes == self._mtimes:
+            return
+
+        vid_pattern = re.compile(r"\b([LK]\d{2}_V\d{3})\b", re.IGNORECASE)
+        loaded_rows: list[dict] = []
+        info_list: list[dict] = []
+
+        for path in csv_files:
+            file_rows = 0
+            try:
+                with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as handle:
+                    sample = handle.read(4096)
+                    handle.seek(0)
+                    delim = ","
+                    if "\t" in sample and sample.count("\t") > sample.count(","):
+                        delim = "\t"
+                    elif ";" in sample and sample.count(";") > sample.count(","):
+                        delim = ";"
+                    reader = csv.reader(handle, delimiter=delim)
+                    header: list[str] | None = None
+                    vid_col = -1
+                    frame_col = -1
+                    ts_col = -1
+                    for row_idx, row in enumerate(reader):
+                        if not row or not any(c.strip() for c in row):
+                            continue
+                        if row_idx == 0:
+                            low = [c.strip().lower() for c in row]
+                            if any(h in ("video_id", "video", "video_stem", "text", "ocr", "ocr_text", "transcript", "content") for h in low):
+                                header = low
+                                for ci, h in enumerate(low):
+                                    if h in ("video_id", "video", "video_stem", "filename", "file") and vid_col < 0:
+                                        vid_col = ci
+                                    elif h in ("frame_id", "frame", "frame_idx") and frame_col < 0:
+                                        frame_col = ci
+                                    elif h in ("timestamp", "time", "pts_time", "seconds", "timestamp_ms") and ts_col < 0:
+                                        ts_col = ci
+                                continue
+
+                        video_stem = ""
+                        if 0 <= vid_col < len(row):
+                            video_stem = clean_video_name(row[vid_col]).upper()
+                        if not video_stem or not vid_pattern.search(video_stem):
+                            for cell in row:
+                                m = vid_pattern.search(cell)
+                                if m:
+                                    video_stem = m.group(1).upper()
+                                    break
+                        if not video_stem:
+                            continue
+
+                        frame_id = None
+                        if 0 <= frame_col < len(row):
+                            try:
+                                frame_id = int(float(row[frame_col].strip()))
+                            except Exception:
+                                pass
+
+                        timestamp = None
+                        if 0 <= ts_col < len(row):
+                            try:
+                                timestamp = float(row[ts_col].strip())
+                            except Exception:
+                                pass
+
+                        text_parts = [
+                            c.strip()
+                            for ci, c in enumerate(row)
+                            if ci not in (vid_col, frame_col, ts_col) and c.strip() and c.strip().upper() != video_stem
+                        ]
+                        text_joined = " | ".join(text_parts)
+                        if not text_joined:
+                            continue
+                        loaded_rows.append({
+                            "video_stem": video_stem,
+                            "frame_id": frame_id,
+                            "timestamp": timestamp,
+                            "text": text_joined,
+                            "text_low": text_joined.lower(),
+                            "text_norm": strip_accents(text_joined),
+                            "file": path.name,
+                        })
+                        file_rows += 1
+            except Exception:
+                pass
+            info_list.append({"name": path.name, "rows": file_rows})
+
+        self.rows = loaded_rows
+        self.files_info = info_list
+        self._mtimes = current_mtimes
+
+    def status(self) -> dict:
+        self.reload_if_needed()
+        unique_vids = len({r["video_stem"] for r in self.rows})
+        return {
+            "total_rows": len(self.rows),
+            "unique_videos": unique_vids,
+            "files": self.files_info,
+        }
+
+    def search(self, query: str, limit: int = 80) -> dict:
+        self.reload_if_needed()
+        q_raw = query.strip()
+        if not q_raw:
+            return {"query": "", "video_ids": [], "matches": [], "total_rows": len(self.rows), "files": self.files_info}
+
+        # Split by comma or semicolon into multiple keywords
+        terms_raw = [t.strip() for t in q_raw.replace(";", ",").split(",") if t.strip()]
+        terms = [(t.lower(), strip_accents(t)) for t in terms_raw]
+
+        video_term_hits: dict[str, set[int]] = defaultdict(set)
+        video_row_counts: dict[str, int] = defaultdict(int)
+        matched_snippets: list[dict] = []
+
+        for r in self.rows:
+            t_low = r["text_low"]
+            t_norm = r["text_norm"]
+            hit_idxs = [
+                ti for ti, (q_low, q_norm) in enumerate(terms)
+                if q_low in t_low or (q_norm and q_norm in t_norm)
+            ]
+            if hit_idxs:
+                stem = r["video_stem"]
+                video_term_hits[stem].update(hit_idxs)
+                video_row_counts[stem] += len(hit_idxs)
+                if len(matched_snippets) < limit:
+                    matched_snippets.append({
+                        "video_id": stem,
+                        "frame_id": r["frame_id"],
+                        "timestamp": r["timestamp"],
+                        "text": r["text"][:220],
+                        "file": r["file"],
+                        "matched_terms": len(hit_idxs),
+                    })
+
+        # If multiple terms were given, prefer videos that contain ALL terms (intersection across terms); fallback to most terms matched
+        all_term_videos = [v for v, hits in video_term_hits.items() if len(hits) == len(terms)]
+        target_videos = all_term_videos if all_term_videos else list(video_term_hits.keys())
+        target_videos.sort(key=lambda v: (len(video_term_hits[v]), video_row_counts[v], v), reverse=True)
+
+        target_set = set(target_videos)
+        filtered_snippets = [m for m in matched_snippets if m["video_id"] in target_set][:limit]
+
+        return {
+            "query": q_raw,
+            "video_ids": target_videos,
+            "video_count": len(target_videos),
+            "all_terms_matched": bool(all_term_videos),
+            "matches": filtered_snippets,
+            "total_rows": len(self.rows),
+            "files": self.files_info,
+        }
 
 
 def main() -> None:
