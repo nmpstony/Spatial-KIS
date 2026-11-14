@@ -528,6 +528,8 @@ let lastVisualResults = [];
 let lastVisualLatencyMs = 0;
 let activeOcrFilter = null; // { query, videoIds, videoSet, matchByVideo, matches }
 let ocrShowAll = false;
+let ocrRequestSeq = 0;
+let ocrAbortController = null;
 
 function escapeHtml(str) {
   return String(str || '')
@@ -787,6 +789,11 @@ function renderVisualResults() {
 }
 
 function resetOcrFilter() {
+  ocrRequestSeq += 1;
+  if (ocrAbortController) {
+    ocrAbortController.abort();
+    ocrAbortController = null;
+  }
   activeOcrFilter = null;
   if (csvResultsBar) csvResultsBar.style.display = 'none';
   renderOcrMatchesSection('', [], 0);
@@ -812,14 +819,24 @@ async function runCsvSearch() {
     return [];
   }
 
+  ocrRequestSeq += 1;
+  const reqSeq = ocrRequestSeq;
+  if (ocrAbortController) ocrAbortController.abort();
+  ocrAbortController = new AbortController();
+  const candidateSig = candidateVids.join(',');
+
   try {
     const r = await fetch('/api/csv/search', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query: q, limit: 120, video_filter: candidateVids })
+      body: JSON.stringify({ query: q, limit: 120, video_filter: candidateVids }),
+      signal: ocrAbortController.signal
     });
-    if (!r.ok) return [];
+    if (!r.ok || reqSeq !== ocrRequestSeq) return [];
     const data = await r.json();
+    if (reqSeq !== ocrRequestSeq || getVisualCandidateVideos().join(',') !== candidateSig) {
+      return [];
+    }
     const vids = data.video_ids || [];
     const matches = data.matches || [];
     const videoSet = new Set(vids.map((v) => String(v).toUpperCase()));
@@ -957,6 +974,11 @@ async function runSearch() {
 
   status.textContent = '⏳ Đang truy vấn trên 633,600 keyframes...';
   results.innerHTML = '';
+  ocrRequestSeq += 1;
+  if (ocrAbortController) {
+    ocrAbortController.abort();
+    ocrAbortController = null;
+  }
   lastVisualResults = [];
   activeOcrFilter = null;
   if (csvResultsBar) csvResultsBar.style.display = 'none';

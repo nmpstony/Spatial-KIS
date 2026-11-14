@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import pickle
 import re
 import unicodedata
@@ -427,6 +428,8 @@ class LocalMemmapIndex:
         return nearby
 
 
+logger = logging.getLogger(__name__)
+
 _OCR_CONFUSIONS = str.maketrans({
     "0": "o",
     "1": "l",
@@ -434,12 +437,55 @@ _OCR_CONFUSIONS = str.maketrans({
     "4": "a",
     "5": "s",
     "6": "g",
+    "7": "t",
     "8": "b",
+    "9": "g",
     "@": "a",
     "$": "s",
 })
 _NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
 _NON_ALNUM_KEEP_PIPE_RE = re.compile(r"[^a-z0-9|]+")
+
+# Conservative EasyOCR visual confusion pairs (weight 0.30 instead of 1.00)
+_CONFUSION_PAIRS: frozenset[tuple[str, str]] = frozenset(
+    pair
+    for a, b in (
+        ("o", "q"), ("o", "d"), ("q", "d"),
+        ("i", "l"), ("i", "j"), ("l", "j"), ("i", "t"), ("j", "t"),
+        ("u", "v"), ("b", "v"), ("n", "m"), ("c", "e"),
+        ("a", "o"), ("h", "k"),
+    )
+    for pair in ((a, b), (b, a))
+)
+
+# Connected-component bitmask & canonical signature for O(1) unit-edit prefiltering
+_GROUP_BITS: dict[str, int] = {}
+_GROUP_CHAR_TRANS: dict[int, str] = {}
+_SIG_ALPHABET = "0123456789abcdef"
+for _bit_idx, _grp in enumerate((
+    "aoqd", "iljt", "uvb", "nm", "ce", "hk",
+    "f", "g", "p", "r", "s", "w", "x", "y", "z",
+)):
+    _sig_ch = _SIG_ALPHABET[_bit_idx]
+    for _ch in _grp:
+        _GROUP_BITS[_ch] = 1 << _bit_idx
+        _GROUP_CHAR_TRANS[ord(_ch)] = _sig_ch
+for _ch in "0123456789":
+    _GROUP_BITS[_ch] = 1 << 15
+    _GROUP_CHAR_TRANS[ord(_ch)] = _ch
+
+
+def _conf_mask(s: str) -> int:
+    m = 0
+    gb = _GROUP_BITS
+    for ch in s:
+        m |= gb.get(ch, 0)
+    return m
+
+
+def _conf_sig(s: str) -> str:
+    """Map characters in each visual-confusion group to a single canonical symbol."""
+    return s.translate(_GROUP_CHAR_TRANS)
 
 
 def strip_accents(text: str) -> str:
@@ -466,35 +512,82 @@ def _ocr_segments_and_text(text_norm: str) -> tuple[str, tuple[tuple[str, ...], 
     return text_ocr, segments
 
 
-def _levenshtein_max(a: str, b: str, max_dist: int) -> int:
+def _ocr_weighted_cost(a: str, b: str, max_cost: float, max_unit_edits: int = 1) -> float:
+    """Confusion-weighted Levenshtein cost with early exit and unit-edit cap."""
     la, lb = len(a), len(b)
-    if abs(la - lb) > max_dist:
-        return max_dist + 1
+    if abs(la - lb) > max_cost + 1e-6:
+        return max_cost + 1.0
     if a == b:
-        return 0
+        return 0.0
     if la > lb:
         a, b = b, a
         la, lb = lb, la
-    prev = list(range(la + 1))
-    for j, cb in enumerate(b, 1):
-        curr = [j]
-        min_row = j
-        for i, ca in enumerate(a, 1):
-            cost = 0 if ca == cb else 1
-            val = min(prev[i] + 1, curr[i - 1] + 1, prev[i - 1] + cost)
-            curr.append(val)
-            if val < min_row:
-                min_row = val
-        if min_row > max_dist:
-            return max_dist + 1
-        prev = curr
-    return prev[-1]
+
+    prev_c = [float(i) for i in range(la + 1)]
+    prev_u = list(range(la + 1))
+    curr_c = [0.0] * (la + 1)
+    curr_u = [0] * (la + 1)
+    thresh = max_cost + 1e-6
+    pairs = _CONFUSION_PAIRS
+
+    for j in range(1, lb + 1):
+        cb = b[j - 1]
+        curr_c[0] = float(j)
+        curr_u[0] = j
+        min_row = float(j)
+        for i in range(1, la + 1):
+            ca = a[i - 1]
+            if ca == cb:
+                best_c = prev_c[i - 1]
+                best_u = prev_u[i - 1]
+            elif (ca, cb) in pairs:
+                best_c = prev_c[i - 1] + 0.30
+                best_u = prev_u[i - 1]
+            else:
+                best_c = prev_c[i - 1] + 1.0
+                best_u = prev_u[i - 1] + 1
+
+            ins_c = curr_c[i - 1] + 1.0
+            ins_u = curr_u[i - 1] + 1
+            if ins_c < best_c or (ins_c == best_c and ins_u < best_u):
+                best_c = ins_c
+                best_u = ins_u
+
+            del_c = prev_c[i] + 1.0
+            del_u = prev_u[i] + 1
+            if del_c < best_c or (del_c == best_c and del_u < best_u):
+                best_c = del_c
+                best_u = del_u
+
+            curr_c[i] = best_c
+            curr_u[i] = best_u
+            if best_c < min_row:
+                min_row = best_c
+        if min_row > thresh:
+            return max_cost + 1.0
+        prev_c, curr_c = curr_c, prev_c
+        prev_u, curr_u = curr_u, prev_u
+
+    final_c, final_u = prev_c[la], prev_u[la]
+    if final_c > thresh or final_u > max_unit_edits:
+        return max_cost + 1.0
+    return final_c
 
 
 def _make_trigrams(compact: str) -> tuple[str, ...]:
     if len(compact) < 3:
         return ()
     return tuple({compact[i : i + 3] for i in range(len(compact) - 2)})
+
+
+def _fuzzy_budget(q_len: int) -> tuple[float, int]:
+    """Return (max_weighted_cost, max_unit_edits) for a compact query of length q_len."""
+    if q_len <= 3:
+        return (0.0, 0)
+    if q_len == 4:
+        return (0.35, 0)
+    max_cost = min(1.60, max(0.60, 0.20 * q_len))
+    return (max_cost, 1)
 
 
 def _fuzzy_phrase_match(
@@ -504,70 +597,42 @@ def _fuzzy_phrase_match(
     row_segments: tuple[tuple[str, ...], ...],
     row_compact: str,
 ) -> float:
-    if not row_segments or len(q_compact) < 5:
+    q_len = len(q_compact)
+    if not row_segments or q_len < 4:
         return 0.0
-    if q_trigrams and not any(tg in row_compact for tg in q_trigrams):
-        return 0.0
+    max_cost, max_unit = _fuzzy_budget(q_len)
+    if q_len >= 5 and q_trigrams and not any(tg in row_compact for tg in q_trigrams):
+        pass  # Allow full segment check if confusion altered trigrams (e.g. 'koanken' vs 'hoankiem')
 
     k = len(q_words)
-    if k == 1:
-        qw = q_words[0]
-        ql = len(qw)
-        max_ed = 1 if ql <= 7 else 2
-        best = 0.0
-        for seg_tokens in row_segments:
-            for tok in seg_tokens:
-                if abs(len(tok) - ql) > max_ed:
-                    continue
-                d = _levenshtein_max(qw, tok, max_ed)
-                if d <= max_ed:
-                    score = 1.0 - (d / ql)
-                    if score > best:
-                        best = score
-        return best
-
-    q_len = len(q_compact)
-    max_total_ed = 1 if q_len <= 7 else (2 if q_len <= 11 else 3)
-    caps = tuple(0 if len(w) <= 2 else (1 if len(w) <= 7 else 2) for w in q_words)
-    qlens = tuple(len(w) for w in q_words)
-    qw0, ql0, cap0 = q_words[0], qlens[0], caps[0]
+    window_sizes = (1, 2) if k == 1 else tuple(w for w in (k, k - 1, k + 1) if w >= 1)
     best = 0.0
+    max_len_diff = int(max_cost) + 1
+    q_mask = _conf_mask(q_compact)
 
     for seg_tokens in row_segments:
         n_tok = len(seg_tokens)
-        if n_tok < k:
-            continue
-        for i in range(n_tok - k + 1):
-            tok0 = seg_tokens[i]
-            if abs(len(tok0) - ql0) > cap0:
+        for w_sz in window_sizes:
+            if n_tok < w_sz:
                 continue
-            total_len = len(tok0)
-            len_ok = True
-            for j in range(1, k):
-                tl = len(seg_tokens[i + j])
-                if abs(tl - qlens[j]) > caps[j]:
-                    len_ok = False
-                    break
-                total_len += tl
-            if not len_ok or abs(total_len - q_len) > max_total_ed:
-                continue
-
-            if _levenshtein_max(qw0, tok0, cap0) > cap0:
-                continue
-            word_ok = True
-            for j in range(1, k):
-                if _levenshtein_max(q_words[j], seg_tokens[i + j], caps[j]) > caps[j]:
-                    word_ok = False
-                    break
-            if not word_ok:
-                continue
-
-            win_compact = "".join(seg_tokens[i : i + k])
-            d = _levenshtein_max(q_compact, win_compact, max_total_ed)
-            if d <= max_total_ed:
-                score = 1.0 - (d / q_len)
-                if score > best:
-                    best = score
+            for i in range(n_tok - w_sz + 1):
+                win = seg_tokens[i : i + w_sz]
+                win_compact = "".join(win)
+                if abs(len(win_compact) - q_len) > max_len_diff:
+                    continue
+                if q_len == 4 and len(win_compact) != 4:
+                    continue
+                missing = q_mask & ~_conf_mask(win_compact)
+                if max_unit == 0:
+                    if missing:
+                        continue
+                elif missing & (missing - 1):
+                    continue
+                cost = _ocr_weighted_cost(q_compact, win_compact, max_cost, max_unit_edits=max_unit)
+                if cost <= max_cost + 1e-6:
+                    score = max(0.05, 1.0 - (cost / max(q_len, 1)))
+                    if score > best:
+                        best = score
     return best
 
 
@@ -579,6 +644,14 @@ class CsvSearchEngine:
         self._mtimes: dict[str, float] = {}
         self.rows: list[dict] = []
         self.files_info: list[dict] = []
+        self.rows_by_video: dict[str, list[int]] = {}
+        self.vocab_postings: dict[str, list[int]] = {}
+        self.vocab_trigrams: dict[str, list[str]] = {}
+        self.vocab_sig_trigrams: dict[str, list[str]] = {}
+        self.vocab_by_len: dict[int, list[str]] = {}
+        self.vocab_masks: dict[str, int] = {}
+        self.row_sig_trigrams: dict[str, list[int]] = {}
+        self._fuzzy_vocab_cache: dict[str, tuple[str, ...]] = {}
         self.reload_if_needed()
 
     def _discover_csv_files(self) -> list[Path]:
@@ -592,7 +665,6 @@ class CsvSearchEngine:
 
     def reload_if_needed(self, force: bool = False) -> None:
         import csv
-        import re
 
         csv_files = self._discover_csv_files()
         current_mtimes = {str(p): p.stat().st_mtime for p in csv_files if p.is_file()}
@@ -602,6 +674,14 @@ class CsvSearchEngine:
         vid_pattern = re.compile(r"\b([LK]\d{2}_V\d{3})\b", re.IGNORECASE)
         loaded_rows: list[dict] = []
         info_list: list[dict] = []
+        rows_by_video: dict[str, list[int]] = defaultdict(list)
+        vocab_postings: dict[str, list[int]] = defaultdict(list)
+        row_sig_trigrams: dict[str, list[int]] = defaultdict(list)
+
+        def _add_posting(key: str, ridx: int) -> None:
+            plist = vocab_postings[key]
+            if not plist or plist[-1] != ridx:
+                plist.append(ridx)
 
         for path in csv_files:
             file_rows = 0
@@ -615,17 +695,17 @@ class CsvSearchEngine:
                     elif ";" in sample and sample.count(";") > sample.count(","):
                         delim = ";"
                     reader = csv.reader(handle, delimiter=delim)
-                    header: list[str] | None = None
                     vid_col = -1
                     frame_col = -1
                     ts_col = -1
+                    text_cols: list[int] = []
+                    skip_cols: set[int] = set()
                     for row_idx, row in enumerate(reader):
                         if not row or not any(c.strip() for c in row):
                             continue
                         if row_idx == 0:
                             low = [c.strip().lower() for c in row]
                             if any(h in ("video_id", "video", "video_stem", "text", "ocr", "ocr_text", "transcript", "content") for h in low):
-                                header = low
                                 for ci, h in enumerate(low):
                                     if h in ("video_id", "video", "video_stem", "filename", "file") and vid_col < 0:
                                         vid_col = ci
@@ -633,6 +713,10 @@ class CsvSearchEngine:
                                         frame_col = ci
                                     elif h in ("timestamp", "time", "pts_time", "seconds", "timestamp_ms") and ts_col < 0:
                                         ts_col = ci
+                                    elif h in ("text", "ocr", "ocr_text", "transcript", "content"):
+                                        text_cols.append(ci)
+                                    elif h in ("conf", "confidence", "score", "bbox", "box"):
+                                        skip_cols.add(ci)
                                 continue
 
                         video_stem = ""
@@ -661,16 +745,55 @@ class CsvSearchEngine:
                             except Exception:
                                 pass
 
-                        text_parts = [
-                            c.strip()
-                            for ci, c in enumerate(row)
-                            if ci not in (vid_col, frame_col, ts_col) and c.strip() and c.strip().upper() != video_stem
-                        ]
+                        if text_cols:
+                            text_parts = [
+                                row[ci].strip()
+                                for ci in text_cols
+                                if ci < len(row) and row[ci].strip() and row[ci].strip().upper() != video_stem
+                            ]
+                        else:
+                            text_parts = [
+                                c.strip()
+                                for ci, c in enumerate(row)
+                                if ci not in (vid_col, frame_col, ts_col) and ci not in skip_cols and c.strip() and c.strip().upper() != video_stem
+                            ]
                         text_joined = " | ".join(text_parts)
                         if not text_joined:
                             continue
                         text_norm = strip_accents(text_joined)
                         text_ocr, row_segments = _ocr_segments_and_text(text_norm)
+                        ridx = len(loaded_rows)
+                        sig_segs_list: list[tuple[str, int, int]] = []
+                        row_sig_seen: set[str] = set()
+                        for seg_toks in row_segments:
+                            seg_compact = "".join(seg_toks)
+                            seg_sig = _conf_sig(seg_compact)
+                            seg_mask = _conf_mask(seg_compact)
+                            seg_len = len(seg_sig)
+                            sig_segs_list.append((seg_sig, seg_mask, seg_len))
+                            if seg_len >= 3:
+                                for tj in range(seg_len - 2):
+                                    stg = seg_sig[tj : tj + 3]
+                                    if stg not in row_sig_seen:
+                                        row_sig_seen.add(stg)
+                                        row_sig_trigrams[stg].append(ridx)
+                            nt = len(seg_toks)
+                            for si, tok in enumerate(seg_toks):
+                                if len(tok) >= 2:
+                                    _add_posting(tok, ridx)
+                                if si + 1 < nt:
+                                    w2 = tok + seg_toks[si + 1]
+                                    if 3 <= len(w2) <= 24:
+                                        _add_posting(w2, ridx)
+                                    # Index 3+ token spans up to length 6 so 5-char multi-word queries retain full recall
+                                    if len(w2) <= 6:
+                                        acc = w2
+                                        sj = si + 2
+                                        while sj < nt and len(acc) < 6:
+                                            acc += seg_toks[sj]
+                                            sj += 1
+                                            if 4 <= len(acc) <= 6:
+                                                _add_posting(acc, ridx)
                         loaded_rows.append({
                             "video_stem": video_stem,
                             "frame_id": frame_id,
@@ -681,15 +804,38 @@ class CsvSearchEngine:
                             "text_ocr": text_ocr,
                             "text_compact": text_ocr.replace(" ", ""),
                             "segments": row_segments,
+                            "sig_segs": tuple(sig_segs_list),
                             "file": path.name,
                         })
+                        rows_by_video[video_stem].append(ridx)
                         file_rows += 1
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Failed reading CSV %s: %s", path, exc)
             info_list.append({"name": path.name, "rows": file_rows})
+
+        vocab_trigrams: dict[str, list[str]] = defaultdict(list)
+        vocab_sig_trigrams: dict[str, list[str]] = defaultdict(list)
+        vocab_by_len: dict[int, list[str]] = defaultdict(list)
+        vocab_masks: dict[str, int] = {}
+        for vkey in vocab_postings:
+            vocab_masks[vkey] = _conf_mask(vkey)
+            vocab_by_len[len(vkey)].append(vkey)
+            if len(vkey) >= 3:
+                for tg in _make_trigrams(vkey):
+                    vocab_trigrams[tg].append(vkey)
+                for stg in _make_trigrams(_conf_sig(vkey)):
+                    vocab_sig_trigrams[stg].append(vkey)
 
         self.rows = loaded_rows
         self.files_info = info_list
+        self.rows_by_video = dict(rows_by_video)
+        self.vocab_postings = dict(vocab_postings)
+        self.vocab_trigrams = dict(vocab_trigrams)
+        self.vocab_sig_trigrams = dict(vocab_sig_trigrams)
+        self.vocab_by_len = dict(vocab_by_len)
+        self.vocab_masks = vocab_masks
+        self.row_sig_trigrams = dict(row_sig_trigrams)
+        self._fuzzy_vocab_cache = {}
         self._mtimes = current_mtimes
 
     def status(self) -> dict:
@@ -700,6 +846,112 @@ class CsvSearchEngine:
             "unique_videos": unique_vids,
             "files": self.files_info,
         }
+
+    def _candidate_row_indices(
+        self,
+        terms: list[tuple],
+        allowed_upper: set[str] | None,
+        fuzzy: bool,
+    ) -> list[int]:
+        if allowed_upper is not None:
+            allowed_rows: list[int] = []
+            for stem in allowed_upper:
+                allowed_rows.extend(self.rows_by_video.get(stem, ()))
+            if len(allowed_rows) <= 8000:
+                allowed_rows.sort()
+                return allowed_rows
+            allowed_row_set: set[int] | None = set(allowed_rows)
+        else:
+            allowed_row_set = None
+
+        cand_set: set[int] = set()
+        vocab_masks = self.vocab_masks
+        for q_low, q_norm, q_ocr, q_words, q_compact, q_tri, is_num in terms:
+            # 1) Exact / substring matches via trigram-indexed or direct vocab keys
+            if q_compact:
+                if q_compact in self.vocab_postings:
+                    cand_set.update(self.vocab_postings[q_compact])
+                if len(q_compact) >= 3:
+                    for vk in self.vocab_trigrams.get(q_compact[:3], ()):
+                        if q_compact in vk:
+                            cand_set.update(self.vocab_postings[vk])
+                else:
+                    for vk, plist in self.vocab_postings.items():
+                        if q_compact in vk:
+                            cand_set.update(plist)
+            if len(q_words) > 1:
+                for qw in q_words:
+                    if len(qw) >= 3 and qw in self.vocab_postings:
+                        cand_set.update(self.vocab_postings[qw])
+
+            # 2) Confusion-weighted fuzzy vocabulary expansion via canonical signature trigrams + cache
+            if fuzzy and not is_num and len(q_compact) >= 4:
+                q_len = len(q_compact)
+                max_cost, max_unit = _fuzzy_budget(q_len)
+                q_mask = _conf_mask(q_compact)
+                q_sig = _conf_sig(q_compact)
+                min_vk_len = 4 if q_len == 4 else max(4, q_len - (int(max_cost) + 1))
+                max_vk_len = 4 if q_len == 4 else q_len + (int(max_cost) + 1)
+
+                matched_vks = self._fuzzy_vocab_cache.get(q_compact)
+                if matched_vks is None:
+                    q_sig_tris = _make_trigrams(q_sig)
+                    tg_pool: set[str] = set()
+                    for stg in q_sig_tris:
+                        for vk in self.vocab_sig_trigrams.get(stg, ()):
+                            if min_vk_len <= len(vk) <= max_vk_len:
+                                missing = q_mask & ~vocab_masks[vk]
+                                if (missing == 0) if max_unit == 0 else ((missing & (missing - 1)) == 0):
+                                    tg_pool.add(vk)
+                    if q_len == 5:
+                        q_sig_bgs = tuple({q_sig[i : i + 2] for i in range(4)})
+                        for cand_l in range(min_vk_len, max_vk_len + 1):
+                            for vk in self.vocab_by_len.get(cand_l, ()):
+                                missing = q_mask & ~vocab_masks[vk]
+                                if (missing == 0) if max_unit == 0 else ((missing & (missing - 1)) == 0):
+                                    vk_sig = _conf_sig(vk)
+                                    if any(bg in vk_sig for bg in q_sig_bgs):
+                                        tg_pool.add(vk)
+                    matched_list = [
+                        vk
+                        for vk in tg_pool
+                        if _ocr_weighted_cost(q_compact, vk, max_cost, max_unit_edits=max_unit) <= max_cost + 1e-6
+                    ]
+                    matched_vks = tuple(matched_list)
+                    if len(self._fuzzy_vocab_cache) >= 512:
+                        self._fuzzy_vocab_cache.clear()
+                    self._fuzzy_vocab_cache[q_compact] = matched_vks
+                for vk in matched_vks:
+                    cand_set.update(self.vocab_postings[vk])
+
+                # 3) Multi-token window recall (w >= 3): pigeonhole canonical signature parts over segment index
+                if len(q_words) >= 2 and (q_len == 4 or q_len >= 6):
+                    parts = (q_sig,) if max_unit == 0 else (q_sig[: q_len // 2], q_sig[q_len // 2 :])
+                    row_sig_tris = self.row_sig_trigrams
+                    for sub in parts:
+                        tris = sorted(_make_trigrams(sub), key=lambda tg: len(row_sig_tris.get(tg, ())))
+                        if not tris:
+                            continue
+                        sub_rows = set(row_sig_tris.get(tris[0], ()))
+                        for tg in tris[1:]:
+                            if not sub_rows:
+                                break
+                            sub_rows.intersection_update(row_sig_tris.get(tg, ()))
+                        if allowed_row_set is not None:
+                            sub_rows.intersection_update(allowed_row_set)
+                        for idx in sub_rows:
+                            if idx in cand_set:
+                                continue
+                            for sp, sm, slen in self.rows[idx]["sig_segs"]:
+                                if slen >= min_vk_len and sub in sp:
+                                    missing = q_mask & ~sm
+                                    if (missing == 0) if max_unit == 0 else ((missing & (missing - 1)) == 0):
+                                        cand_set.add(idx)
+                                        break
+
+        if allowed_row_set is not None:
+            cand_set.intersection_update(allowed_row_set)
+        return sorted(cand_set)
 
     def search(
         self,
@@ -736,10 +988,11 @@ class CsvSearchEngine:
             else None
         )
 
-        for r in self.rows:
+        cand_indices = self._candidate_row_indices(terms, allowed_upper, fuzzy)
+
+        for ridx in cand_indices:
+            r = self.rows[ridx]
             stem = r["video_stem"]
-            if allowed_upper is not None and stem.upper() not in allowed_upper:
-                continue
             t_low = r["text_low"]
             t_norm = r["text_norm"]
             t_ocr = r["text_ocr"]
@@ -750,10 +1003,14 @@ class CsvSearchEngine:
             row_best_tier = 0
             row_score = 0.0
             for ti, (q_low, q_norm, q_ocr, q_words, q_compact, q_tri, is_num) in enumerate(terms):
-                if q_low in t_low or (q_norm and q_norm in t_norm):
+                # Tier 4 / 3: Exact boundary or exact normalized substring
+                exact_hit = (q_low in t_low) or bool(q_norm and q_norm in t_norm)
+                if exact_hit:
                     hit_idxs.append(ti)
-                    row_best_tier = max(row_best_tier, 3)
-                    row_score += 3.0
+                    is_boundary = bool(q_ocr and f" {q_ocr} " in f" {t_norm} ")
+                    tier = 4 if is_boundary else 3
+                    row_best_tier = max(row_best_tier, tier)
+                    row_score += float(tier)
                 elif not is_num and q_ocr and q_ocr in t_ocr:
                     hit_idxs.append(ti)
                     row_best_tier = max(row_best_tier, 2)
@@ -773,7 +1030,7 @@ class CsvSearchEngine:
                 if len(matched_snippets) < raw_cap or row_best_tier >= 2:
                     frame_id = r["frame_id"]
                     ts_val = r["timestamp"]
-                    match_type = "exact" if row_best_tier == 3 else ("ocr" if row_best_tier == 2 else "fuzzy")
+                    match_type = "exact" if row_best_tier >= 3 else ("ocr" if row_best_tier == 2 else "fuzzy")
                     matched_snippets.append({
                         "video_id": stem,
                         "frame_id": frame_id,
