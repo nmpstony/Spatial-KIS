@@ -85,6 +85,8 @@ def test_local_memmap_index_builds_and_searches():
         csv_eng = CsvSearchEngine(root)
         hit_acc = csv_eng.search("Tuyên Quang")
         assert hit_acc["video_ids"] == ["L01_V001"]
+        assert hit_acc["matches"][0]["image_path"] == "images/L01_V001/frame_100.webp"
+        assert hit_acc["matches"][0]["timestamp_ms"] == 5000
         hit_no_acc = csv_eng.search("tuyen quang")
         assert hit_no_acc["video_ids"] == ["L01_V001"]
 

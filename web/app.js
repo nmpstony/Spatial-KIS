@@ -520,6 +520,161 @@ const videoFilterInput = document.querySelector('#video-filter-input');
 const filterL21L24Btn = document.querySelector('#filter-l21-l24-btn');
 const filterClearBtn = document.querySelector('#filter-clear-btn');
 const csvResultsBar = document.querySelector('#csv-results-bar');
+const ocrResultsSection = document.querySelector('#ocr-results-section');
+
+let lastCsvQuery = '';
+let lastCsvMatches = [];
+let ocrShowAll = false;
+
+function escapeHtml(str) {
+  return String(str || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+const REGION_NAMES = {
+  0: "Toàn ảnh (all)", 1: "Top-Left (1)", 2: "Top-Center (2)", 3: "Top-Right (3)",
+  4: "Mid-Left (4)", 5: "Center (5)", 6: "Mid-Right (6)", 7: "Bot-Left (7)",
+  8: "Bot-Center (8)", 9: "Bot-Right (9)"
+};
+
+function createResultCard(item, opts = {}) {
+  const isOcr = Boolean(opts.isOcr);
+  const card = document.createElement('article');
+  card.className = isOcr ? 'card ocr-card' : 'card';
+
+  const stem = item.video_stem || cleanVideoStem(item.video_id);
+  const ms = item.timestamp_ms !== undefined ? item.timestamp_ms : Math.round((item.timestamp || 0) * 1000);
+  const tsNum = item.timestamp != null ? Number(item.timestamp) : 0;
+  const imgRel = item.image_path
+    ? item.image_path.replace(/^images\//, '')
+    : (item.frame_id != null ? `${stem}/frame_${item.frame_id}.webp` : '');
+  const imgSrc = imgRel ? `/media/keyframe/${imgRel}` : '';
+
+  const nextList = item.next_matches || (item.next_match ? [{ stage: 2, ...item.next_match }] : []);
+  let nextTag = '';
+  let stage1LabelHtml = '';
+  let nextPreviewHtml = '';
+  if (!isOcr && nextList.length > 0) {
+    stage1LabelHtml = `<div style="font-size:11px; color:#79c0ff; text-align:center; margin-top:2px;">🎬 Cảnh 1: ${ms} ms (#${item.frame_id})</div>`;
+    nextTag = nextList
+      .map((nm, idx) => `<span class="card-tag next-tag" data-next-idx="${idx}" title="Bấm để xem Cảnh ${nm.stage || idx + 2}">⏩ Cảnh ${nm.stage || idx + 2} @ ${nm.timestamp_ms}ms</span>`)
+      .join(' ');
+    nextPreviewHtml = nextList
+      .map((nm, idx) => {
+        const nextImg = `/media/keyframe/${nm.image_path.replace(/^images\//, '')}`;
+        const stNum = nm.stage || idx + 2;
+        return `
+          <div class="next-scene-box" data-next-idx="${idx}" title="Ảnh của Cảnh ${stNum} tiếp theo tại ${nm.timestamp_ms} ms">
+            <img src="${nextImg}" loading="lazy" style="aspect-ratio:16/9; width:100%; border-radius:4px; border:1px solid #8957e5; margin-top:4px;">
+            <div style="font-size:11px; color:#d2a8ff; text-align:center;">⏩ Cảnh ${stNum}: ${nm.timestamp_ms} ms (#${nm.frame_id})</div>
+          </div>
+        `;
+      })
+      .join('');
+  }
+
+  const submetaHtml = isOcr
+    ? `<span class="ocr-badge">📝 Khớp OCR</span><span>${tsNum.toFixed(2)}s</span>${item.frame_id != null ? `<span>· #${item.frame_id}</span>` : ''}`
+    : `<span>${tsNum.toFixed(2)}s</span><span>· #${item.frame_id}</span><span>· Score: <b>${Number(item.score || 0).toFixed(3)}</b></span><span class="card-tag">Vùng: <b>${REGION_NAMES[item.region_id] || item.region_id}</b></span>${nextTag}`;
+
+  const ocrTextHtml = isOcr && item.text
+    ? `<div class="ocr-text-snippet" title="${escapeHtml(item.text)}">${escapeHtml(item.text)}</div>`
+    : '';
+
+  card.innerHTML = `
+    ${imgSrc ? `<img class="stage1-img" src="${imgSrc}" alt="${escapeHtml(item.keyframe_id || stem)}" loading="lazy" title="Bấm để xem video và các frame lân cận">` : ''}
+    ${stage1LabelHtml}
+    ${nextPreviewHtml}
+    <div class="card-meta">
+      <span class="video-pill">${escapeHtml(stem)}</span>
+      <span class="ms-pill">${ms} ms</span>
+    </div>
+    <div class="card-submeta">${submetaHtml}</div>
+    ${ocrTextHtml}
+    <div class="card-actions">
+      <button type="button" class="view-btn">▶ Xem Video & Lân cận</button>
+      <button type="button" class="btn-secondary copy-btn" title="Copy mã Video + ms">📋</button>
+    </div>
+    <div class="card-submit-row">
+      <button type="button" class="btn-submit-kis kis-btn">🚀 Nộp KIS</button>
+      <button type="button" class="btn-submit-qa qa-btn">❓ Nộp Q&A</button>
+    </div>
+  `;
+
+  const imgEl = card.querySelector('.stage1-img');
+  if (imgEl) imgEl.onclick = () => inspectResult(item);
+  card.querySelectorAll('.next-scene-box, .next-tag').forEach((el) => {
+    el.onclick = (e) => {
+      e.stopPropagation();
+      const idx = Number(el.dataset.nextIdx) || 0;
+      if (nextList[idx]) inspectResult({ ...item, ...nextList[idx] });
+    };
+  });
+  card.querySelector('.view-btn').onclick = () => inspectResult(item);
+  card.querySelector('.copy-btn').onclick = async () => {
+    const qaVal = qaAnswerInput.value.trim();
+    const txt = qaVal ? `${qaVal}-${stem}-${ms}` : `${stem}\t${ms}`;
+    await navigator.clipboard.writeText(txt);
+    dresStatus.textContent = `📋 Đã copy: ${txt}`;
+    dresStatus.style.color = '#7ee787';
+  };
+  card.querySelector('.kis-btn').onclick = () => submitToDres(stem, ms, 'kis', card);
+  card.querySelector('.qa-btn').onclick = () => submitToDres(stem, ms, 'qa', card);
+  return card;
+}
+
+function renderOcrMatchesSection(query, matches, videoCount) {
+  if (!ocrResultsSection) return;
+  if (!query || !matches || matches.length === 0) {
+    ocrResultsSection.style.display = 'none';
+    ocrResultsSection.innerHTML = '';
+    return;
+  }
+  const initialLimit = 8;
+  const visibleMatches = ocrShowAll ? matches : matches.slice(0, initialLimit);
+  ocrResultsSection.style.display = 'block';
+  ocrResultsSection.innerHTML = `
+    <div class="ocr-section-header">
+      <span>📝 Khung hình khớp bộ lọc OCR "${escapeHtml(query)}" — ${matches.length} frame (${videoCount} video)</span>
+      <div style="display:flex; gap:6px; align-items:center;">
+        ${matches.length > initialLimit ? `<button type="button" id="ocr-toggle-all-btn" class="btn-secondary">${ocrShowAll ? 'Thu gọn (8 frame)' : `Hiện tất cả (${matches.length} frame)`}</button>` : ''}
+        <button type="button" id="ocr-hide-btn" class="btn-secondary" title="Ẩn khung OCR">✕ Ẩn</button>
+      </div>
+    </div>
+    <div class="results ocr-grid"></div>
+  `;
+  const grid = ocrResultsSection.querySelector('.ocr-grid');
+  for (const m of visibleMatches) {
+    const item = {
+      video_id: m.video_id,
+      video_stem: m.video_id,
+      keyframe_id: `${m.video_id}:${m.frame_id ?? 0}`,
+      frame_id: m.frame_id,
+      timestamp: m.timestamp != null ? Number(m.timestamp) : 0,
+      timestamp_ms: m.timestamp_ms != null ? m.timestamp_ms : (m.timestamp != null ? Math.round(Number(m.timestamp) * 1000) : 0),
+      image_path: m.image_path || (m.frame_id != null ? `images/${m.video_id}/frame_${m.frame_id}.webp` : ''),
+      text: m.text || '',
+      score: 1.0,
+    };
+    grid.append(createResultCard(item, { isOcr: true }));
+  }
+  const toggleBtn = ocrResultsSection.querySelector('#ocr-toggle-all-btn');
+  if (toggleBtn) {
+    toggleBtn.onclick = () => {
+      ocrShowAll = !ocrShowAll;
+      renderOcrMatchesSection(query, matches, videoCount);
+    };
+  }
+  const hideBtn = ocrResultsSection.querySelector('#ocr-hide-btn');
+  if (hideBtn) {
+    hideBtn.onclick = () => {
+      ocrResultsSection.style.display = 'none';
+    };
+  }
+}
 
 async function refreshCsvStatus() {
   if (!csvMetaBadge) return;
@@ -571,7 +726,10 @@ if (csvUploadBtn && csvFileInput) {
 async function runCsvSearch(triggerVisualSearch = false) {
   const q = csvQueryInput ? csvQueryInput.value.trim() : '';
   if (!q) {
+    lastCsvQuery = '';
+    lastCsvMatches = [];
     if (csvResultsBar) csvResultsBar.style.display = 'none';
+    renderOcrMatchesSection('', [], 0);
     return [];
   }
   try {
@@ -583,6 +741,9 @@ async function runCsvSearch(triggerVisualSearch = false) {
     if (!r.ok) return [];
     const data = await r.json();
     const vids = data.video_ids || [];
+    lastCsvQuery = q;
+    lastCsvMatches = data.matches || [];
+    ocrShowAll = false;
     if (videoFilterInput) {
       videoFilterInput.value = vids.join(', ');
     }
@@ -593,37 +754,40 @@ async function runCsvSearch(triggerVisualSearch = false) {
       csvResultsBar.style.display = 'block';
       if (data.total_rows === 0) {
         csvResultsBar.innerHTML = `<span style="color:#ffd33d">⚠ Trên server chưa có dữ liệu CSV nào. Hãy bấm nút <b>📂 Nạp file .CSV lên Server</b> ở góc phải!</span>`;
+        renderOcrMatchesSection('', [], 0);
       } else if (vids.length === 0) {
-        csvResultsBar.innerHTML = `<span style="color:#ff7b72">❌ Không tìm thấy từ khóa <b>"${q}"</b> trong ${data.total_rows} dòng CSV. (Tạm tắt lọc giao để không bị trống kết quả)</span>`;
+        csvResultsBar.innerHTML = `<span style="color:#ff7b72">❌ Không tìm thấy từ khóa <b>"${escapeHtml(q)}"</b> trong ${data.total_rows} dòng CSV. (Tạm tắt lọc giao để không bị trống kết quả)</span>`;
         if (useVideoFilterChk) useVideoFilterChk.checked = false;
+        renderOcrMatchesSection('', [], 0);
       } else {
-        const chipsHtml = (data.matches || [])
+        const chipsHtml = lastCsvMatches
           .slice(0, 25)
           .map((m, idx) => {
             const tsLabel = m.timestamp != null ? ` @ ${Number(m.timestamp).toFixed(1)}s` : m.frame_id != null ? ` #${m.frame_id}` : '';
-            const safeText = (m.text || '').replace(/"/g, '&quot;');
-            return `<span class="csv-snippet-chip" data-idx="${idx}" title="${safeText}">🎬 ${m.video_id}${tsLabel}: ${m.text.slice(0, 48)}</span>`;
+            const safeText = escapeHtml(m.text || '');
+            return `<span class="csv-snippet-chip" data-idx="${idx}" title="${safeText}">🎬 ${escapeHtml(m.video_id)}${tsLabel}: ${escapeHtml((m.text || '').slice(0, 48))}</span>`;
           })
           .join('');
         csvResultsBar.innerHTML =
-          `<div style="margin-bottom:4px; color:#7ee787;">✅ Tìm thấy <b>${vids.length} mã video</b> khớp từ khóa <b>"${q}"</b> (Đã tự động điền vào ô Giao ∩ bên phải — Bấm vào chip bên dưới để xem ngay video):</div>` +
+          `<div style="margin-bottom:4px; color:#7ee787;">✅ Tìm thấy <b>${vids.length} mã video</b> khớp từ khóa <b>"${escapeHtml(q)}"</b> (Đã điền vào ô Giao ∩ &amp; hiển thị các frame khớp OCR bên dưới):</div>` +
           `<div>${chipsHtml}</div>`;
         csvResultsBar.querySelectorAll('.csv-snippet-chip').forEach((chip) => {
           chip.onclick = () => {
-            const m = data.matches[Number(chip.dataset.idx)];
+            const m = lastCsvMatches[Number(chip.dataset.idx)];
             if (m) {
               inspectResult({
                 video_id: m.video_id,
                 video_stem: m.video_id,
                 frame_id: m.frame_id || 0,
                 timestamp: m.timestamp != null ? Number(m.timestamp) : 0,
-                timestamp_ms: m.timestamp != null ? Math.round(Number(m.timestamp) * 1000) : 0,
+                timestamp_ms: m.timestamp_ms != null ? m.timestamp_ms : (m.timestamp != null ? Math.round(Number(m.timestamp) * 1000) : 0),
                 fps: 25.0,
                 score: 1.0
               });
             }
           };
         });
+        renderOcrMatchesSection(q, lastCsvMatches, vids.length);
       }
     }
     if (triggerVisualSearch && getConditions().length > 0) {
@@ -656,8 +820,11 @@ if (filterL21L24Btn) {
 if (filterClearBtn) {
   filterClearBtn.onclick = () => {
     videoFilterInput.value = '';
+    lastCsvQuery = '';
+    lastCsvMatches = [];
     if (csvQueryInput) csvQueryInput.value = '';
     if (csvResultsBar) csvResultsBar.style.display = 'none';
+    renderOcrMatchesSection('', [], 0);
     if (getConditions().length > 0) runSearch(true);
   };
 }
@@ -667,7 +834,8 @@ async function runSearch(skipAutoCsv = false) {
   const isDiversify = document.querySelector('#diversify').checked;
   const maxTemporalGap = Number(document.querySelector('#temporal-gap').value) || 45.0;
 
-  if (!skipAutoCsv && csvQueryInput && csvQueryInput.value.trim() && videoFilterInput && !videoFilterInput.value.trim()) {
+  const csvQ = csvQueryInput ? csvQueryInput.value.trim() : '';
+  if (!skipAutoCsv && csvQ && (csvQ !== lastCsvQuery || (videoFilterInput && !videoFilterInput.value.trim()))) {
     await runCsvSearch(false);
   }
 
@@ -751,90 +919,8 @@ async function runSearch(skipAutoCsv = false) {
 
     status.textContent = `✅ Hiển thị ${data.results.length} kết quả tốt nhất (${lat} ms)`;
 
-    const regionNames = {
-      0: "Toàn ảnh (all)", 1: "Top-Left (1)", 2: "Top-Center (2)", 3: "Top-Right (3)",
-      4: "Mid-Left (4)", 5: "Center (5)", 6: "Mid-Right (6)", 7: "Bot-Left (7)",
-      8: "Bot-Center (8)", 9: "Bot-Right (9)"
-    };
-
     for (const item of data.results) {
-      const card = document.createElement('article');
-      card.className = 'card';
-
-      const imgA = `/media/keyframe/${item.image_path.replace(/^images\//, '')}`;
-      const stem = item.video_stem || cleanVideoStem(item.video_id);
-      const ms = item.timestamp_ms !== undefined ? item.timestamp_ms : Math.round((item.timestamp || 0) * 1000);
-
-      const regionTag = `<span class="card-tag">Vùng: <b>${regionNames[item.region_id] || item.region_id}</b></span>`;
-      const nextList = item.next_matches || (item.next_match ? [{ stage: 2, ...item.next_match }] : []);
-      let nextTag = '';
-      let stage1LabelHtml = '';
-      let nextPreviewHtml = '';
-      if (nextList.length > 0) {
-        stage1LabelHtml = `<div style="font-size:11px; color:#79c0ff; text-align:center; margin-top:2px;">🎬 Cảnh 1: ${ms} ms (#${item.frame_id})</div>`;
-        nextTag = nextList
-          .map((nm, idx) => `<span class="card-tag next-tag" data-next-idx="${idx}" title="Bấm để xem Cảnh ${nm.stage || idx + 2}">⏩ Cảnh ${nm.stage || idx + 2} @ ${nm.timestamp_ms}ms</span>`)
-          .join(' ');
-        nextPreviewHtml = nextList
-          .map((nm, idx) => {
-            const nextImg = `/media/keyframe/${nm.image_path.replace(/^images\//, '')}`;
-            const stNum = nm.stage || idx + 2;
-            return `
-              <div class="next-scene-box" data-next-idx="${idx}" title="Ảnh của Cảnh ${stNum} tiếp theo tại ${nm.timestamp_ms} ms">
-                <img src="${nextImg}" loading="lazy" style="aspect-ratio:16/9; width:100%; border-radius:4px; border:1px solid #8957e5; margin-top:4px;">
-                <div style="font-size:11px; color:#d2a8ff; text-align:center;">⏩ Cảnh ${stNum}: ${nm.timestamp_ms} ms (#${nm.frame_id})</div>
-              </div>
-            `;
-          })
-          .join('');
-      }
-
-      card.innerHTML = `
-        <img class="stage1-img" src="${imgA}" alt="${item.keyframe_id}" loading="lazy" title="Cảnh 1 — Bấm để xem video và các frame lân cận">
-        ${stage1LabelHtml}
-        ${nextPreviewHtml}
-        <div class="card-meta">
-          <span class="video-pill">${stem}</span>
-          <span class="ms-pill">${ms} ms</span>
-        </div>
-        <div class="card-submeta">
-          <span>${item.timestamp.toFixed(2)}s</span>
-          <span>· #${item.frame_id}</span>
-          <span>· Score: <b>${item.score.toFixed(3)}</b></span>
-          ${regionTag}
-          ${nextTag}
-        </div>
-        <div class="card-actions">
-          <button type="button" class="view-btn">▶ Xem Video & Lân cận</button>
-          <button type="button" class="btn-secondary copy-btn" title="Copy mã Video + ms">📋</button>
-        </div>
-        <div class="card-submit-row">
-          <button type="button" class="btn-submit-kis kis-btn">🚀 Nộp KIS</button>
-          <button type="button" class="btn-submit-qa qa-btn">❓ Nộp Q&A</button>
-        </div>
-      `;
-
-      card.querySelector('.stage1-img').onclick = () => inspectResult(item);
-      card.querySelectorAll('.next-scene-box, .next-tag').forEach((el) => {
-        el.onclick = (e) => {
-          e.stopPropagation();
-          const idx = Number(el.dataset.nextIdx) || 0;
-          if (nextList[idx]) {
-            inspectResult({ ...item, ...nextList[idx] });
-          }
-        };
-      });
-      card.querySelector('.view-btn').onclick = () => inspectResult(item);
-      card.querySelector('.copy-btn').onclick = async () => {
-        const qaVal = qaAnswerInput.value.trim();
-        const txt = qaVal ? `${qaVal}-${stem}-${ms}` : `${stem}\t${ms}`;
-        await navigator.clipboard.writeText(txt);
-        dresStatus.textContent = `📋 Đã copy: ${txt}`;
-        dresStatus.style.color = '#7ee787';
-      };
-      card.querySelector('.kis-btn').onclick = () => submitToDres(stem, ms, 'kis', card);
-      card.querySelector('.qa-btn').onclick = () => submitToDres(stem, ms, 'qa', card);
-      results.append(card);
+      results.append(createResultCard(item, { isOcr: false }));
     }
   } catch (err) {
     status.textContent = '❌ Lỗi kết nối máy chủ: ' + err.message;

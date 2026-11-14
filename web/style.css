@@ -531,3 +531,47 @@ dialog video {
 .csv-snippet-chip:hover {
   background: #253551;
 }
+.ocr-results-section {
+  background: #101824;
+  border: 1px solid #388bfd;
+  border-radius: 10px;
+  padding: 12px 14px;
+  margin-bottom: 16px;
+}
+.ocr-section-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 10px;
+  font-size: 13.5px;
+  font-weight: 700;
+  color: #ffdf5d;
+}
+.card.ocr-card {
+  border-color: #388bfd;
+  background: #131c2b;
+}
+.ocr-text-snippet {
+  margin-top: 6px;
+  padding: 5px 7px;
+  border-radius: 5px;
+  background: #0d1117;
+  border: 1px solid #2b4562;
+  color: #e6edf3;
+  font-size: 11.5px;
+  line-height: 1.35;
+  max-height: 54px;
+  overflow-y: auto;
+  word-break: break-word;
+}
+.ocr-badge {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: #1f6feb;
+  color: #fff;
+  font-size: 10.5px;
+  font-weight: 700;
+}

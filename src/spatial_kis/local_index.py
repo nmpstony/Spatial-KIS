@@ -571,6 +571,7 @@ class CsvSearchEngine:
         video_term_hits: dict[str, set[int]] = defaultdict(set)
         video_row_counts: dict[str, int] = defaultdict(int)
         matched_snippets: list[dict] = []
+        raw_cap = max(limit * 4, 200)
 
         for r in self.rows:
             t_low = r["text_low"]
@@ -583,11 +584,15 @@ class CsvSearchEngine:
                 stem = r["video_stem"]
                 video_term_hits[stem].update(hit_idxs)
                 video_row_counts[stem] += len(hit_idxs)
-                if len(matched_snippets) < limit:
+                if len(matched_snippets) < raw_cap:
+                    frame_id = r["frame_id"]
+                    ts_val = r["timestamp"]
                     matched_snippets.append({
                         "video_id": stem,
-                        "frame_id": r["frame_id"],
-                        "timestamp": r["timestamp"],
+                        "frame_id": frame_id,
+                        "timestamp": ts_val,
+                        "timestamp_ms": round(ts_val * 1000) if ts_val is not None else 0,
+                        "image_path": f"images/{stem}/frame_{frame_id}.webp" if frame_id is not None else None,
                         "text": r["text"][:220],
                         "file": r["file"],
                         "matched_terms": len(hit_idxs),

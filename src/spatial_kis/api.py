@@ -334,7 +334,26 @@ def csv_status_endpoint() -> dict:
 
 @app.post("/api/csv/search")
 def csv_search_endpoint(req: CsvSearchRequest) -> dict:
-    return csv_engine().search(req.query, limit=req.limit)
+    res = csv_engine().search(req.query, limit=req.limit)
+    matches = res.get("matches") or []
+    if matches:
+        try:
+            engine = local_engine()
+        except Exception:
+            engine = None
+        for m in matches:
+            if not m.get("image_path") and engine is not None:
+                nbs = engine.video_neighbors(
+                    video_id=m["video_id"],
+                    timestamp=float(m.get("timestamp") or 0.0),
+                    window_seconds=10.0,
+                    limit=1,
+                )
+                if nbs:
+                    m["image_path"] = nbs[0]["image_path"]
+                    if m.get("frame_id") is None:
+                        m["frame_id"] = nbs[0]["frame_id"]
+    return res
 
 
 @app.post("/api/csv/upload")
