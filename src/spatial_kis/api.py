@@ -2,20 +2,23 @@ from __future__ import annotations
 
 import json
 import os
+import urllib.error
+import urllib.parse
+import urllib.request
 from functools import lru_cache
 from pathlib import Path
 
-import numpy as np
 import torch
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from pymilvus import MilvusClient
 
+from .expander import variants
+from .local_index import CsvSearchEngine, LocalMemmapIndex, clean_video_name
 from .ranking import Hit, condition_best, conjunction, diversify_by_shot
 from .regions import region_ids
-from .expander import variants
 
 ARTIFACT = Path(os.environ.get("SPATIAL_KIS_ARTIFACT", "artifacts/current"))
 
@@ -27,6 +30,7 @@ def find_video_root() -> Path:
     for candidate in [
         Path("videos"),
         Path("../videos"),
+        Path("/home/team10/dataset"),
         Path(__file__).resolve().parents[2] / "videos",
         Path(__file__).resolve().parents[3] / "videos",
         Path("D:/Courses/HK7/CS336/videos"),
@@ -38,6 +42,7 @@ def find_video_root() -> Path:
 
 VIDEO_ROOT = find_video_root()
 MILVUS_URI = os.environ.get("MILVUS_URI", "http://localhost:19530")
+BACKEND_MODE = os.environ.get("SPATIAL_KIS_BACKEND", "auto").lower()
 HISTORY_PATH = ARTIFACT / "session_history.jsonl"
 
 
@@ -45,15 +50,29 @@ class Condition(BaseModel):
     text: str = Field(min_length=1, max_length=500)
     region: str = "all"
     weight: float = Field(default=1.0, gt=0, le=10)
+    stage: int = Field(default=1, ge=1, le=10)
     variants: list[str] | None = None
 
 
 class SearchRequest(BaseModel):
-    conditions: list[Condition] = Field(min_length=1, max_length=6)
-    top_k: int = Field(default=300, ge=20, le=1024)
+    conditions: list[Condition] = Field(min_length=1, max_length=12)
+    top_k: int = Field(default=300, ge=20, le=2048)
     result_limit: int = Field(default=60, ge=1, le=200)
     diversify: bool = True
     expand: bool = True
+    max_temporal_gap: float = Field(default=45.0, ge=1.0, le=300.0)
+    video_filter: list[str] | None = None
+
+
+class CsvSearchRequest(BaseModel):
+    query: str = ""
+    limit: int = Field(default=80, ge=1, le=500)
+    video_filter: list[str] | None = None
+
+
+class CsvUploadRequest(BaseModel):
+    filename: str = "ocr.csv"
+    content: str
 
 
 class Feedback(BaseModel):
@@ -61,10 +80,30 @@ class Feedback(BaseModel):
     label: str = Field(pattern="^(correct|near|irrelevant)$")
 
 
+class DresLoginRequest(BaseModel):
+    base_url: str = "https://eventretrieval.one"
+    username: str
+    password: str
+
+
+class DresSubmitRequest(BaseModel):
+    base_url: str = "https://eventretrieval.one"
+    session_id: str
+    evaluation_id: str
+    mode: str = Field(default="kis", pattern="^(kis|qa)$")
+    video_id: str
+    start_ms: int = Field(ge=0)
+    end_ms: int | None = None
+    qa_answer: str | None = None
+
+
 class Encoder:
     def __init__(self) -> None:
         import open_clip
+        import threading
 
+        self._lock = threading.Lock()
+        self._cache: dict[str, list[float]] = {}
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model, _, _ = open_clip.create_model_and_transforms("ViT-B-16", pretrained="laion2b_s34b_b88k")
         self.model = self.model.to(self.device).eval()
@@ -72,11 +111,30 @@ class Encoder:
 
     @torch.inference_mode()
     def text(self, text: str) -> list[float]:
-        tokens = self.tokenizer([text]).to(self.device)
-        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.device.type == "cuda"):
-            value = self.model.encode_text(tokens)
-        value = value / value.norm(dim=-1, keepdim=True)
-        return value.float().cpu().numpy()[0].tolist()
+        key = text.strip()
+        cached = self._cache.get(key)
+        if cached is not None:
+            return cached
+        return self.texts([key])[0]
+
+    @torch.inference_mode()
+    def texts(self, items: list[str]) -> list[list[float]]:
+        keys = [t.strip() for t in items]
+        missing = [k for k in dict.fromkeys(keys) if k not in self._cache]
+        if missing:
+            with self._lock:
+                still_missing = [k for k in missing if k not in self._cache]
+                if still_missing:
+                    tokens = self.tokenizer(still_missing).to(self.device)
+                    with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.device.type == "cuda"):
+                        values = self.model.encode_text(tokens)
+                    values = values / values.norm(dim=-1, keepdim=True)
+                    arr = values.float().cpu().numpy()
+                    for k, vec in zip(still_missing, arr):
+                        if len(self._cache) >= 2048:
+                            self._cache.clear()
+                        self._cache[k] = vec.tolist()
+        return [self._cache[k] for k in keys]
 
 
 @lru_cache
@@ -89,19 +147,72 @@ def state() -> dict:
     try:
         return json.loads((ARTIFACT / "active_index.json").read_text(encoding="utf-8"))
     except FileNotFoundError as error:
-        raise RuntimeError("No active_index.json. Import a verified artifact first.") from error
+        if (ARTIFACT / "manifest.jsonl").exists():
+            return {"active_collection": "local_memmap", "search_params": {}}
+        raise RuntimeError("No active_index.json or manifest.jsonl found in artifact.") from error
 
 
+@lru_cache
 def client() -> MilvusClient:
     return MilvusClient(uri=MILVUS_URI)
 
 
+@lru_cache
+def local_engine() -> LocalMemmapIndex:
+    return LocalMemmapIndex(ARTIFACT)
+
+
+@lru_cache
+def csv_engine() -> CsvSearchEngine:
+    return CsvSearchEngine(ARTIFACT)
+
+
+def use_local_engine() -> bool:
+    if BACKEND_MODE == "local":
+        return True
+    if BACKEND_MODE == "milvus":
+        return False
+    if (ARTIFACT / "memmap_index" / "meta.json").exists():
+        return True
+    try:
+        client().list_collections()
+        return False
+    except Exception:
+        return True
+
+
+def resolve_condition_texts(condition: Condition, expand: bool) -> list[str]:
+    if condition.variants:
+        cleaned = [v.strip() for v in condition.variants if v and v.strip()]
+        if cleaned and not (expand and len(cleaned) == 1 and cleaned[0] == condition.text.strip()):
+            return cleaned[:2]
+    if expand:
+        expanded = variants(condition.text)
+        # Use the English translation directly for OpenCLIP when available
+        if len(expanded) > 1:
+            return [expanded[-1]]
+        return expanded[:1]
+    return [condition.text.strip()]
+
+
 def to_hit(row: dict) -> Hit:
     entity = row.get("entity", row)
-    return Hit(keyframe_id=entity["keyframe_id"], score=float(row.get("distance", row.get("score", 0))), metadata={
-        "video_id": entity["video_id"], "shot_id": entity["shot_id"], "frame_id": entity["frame_id"],
-        "timestamp": entity["timestamp"], "image_path": entity["image_path"], "region_id": entity["region_id"],
-    })
+    ts = float(entity["timestamp"])
+    vid = entity["video_id"]
+    return Hit(
+        keyframe_id=entity["keyframe_id"],
+        score=float(row.get("distance", row.get("score", 0))),
+        metadata={
+            "video_id": vid,
+            "video_stem": clean_video_name(vid),
+            "shot_id": entity["shot_id"],
+            "frame_id": entity["frame_id"],
+            "timestamp": ts,
+            "timestamp_ms": int(round(ts * 1000)),
+            "image_path": entity["image_path"],
+            "region_id": entity["region_id"],
+        },
+    )
 
 
 def run_conditions(conditions: list[Condition], top_k: int, expand: bool) -> list[dict[str, Hit]]:
@@ -110,14 +221,20 @@ def run_conditions(conditions: list[Condition], top_k: int, expand: bool) -> lis
     output: list[dict[str, Hit]] = []
     for condition in conditions:
         by_region: list[list[Hit]] = []
+        text_variants = resolve_condition_texts(condition, expand)
+        query_vecs = [encoder().text(text) for text in text_variants]
         for region in region_ids(condition.region):
             region_hits: list[Hit] = []
-            text_variants = condition.variants or (variants(condition.text) if expand else [condition.text])
-            for text in text_variants[:3]:
-                rows = service.search(collection_name=collection, data=[encoder().text(text)], anns_field="embedding",
-                                      limit=top_k, filter=f"region_id == {region}",
-                                      output_fields=["keyframe_id", "video_id", "shot_id", "frame_id", "timestamp", "image_path", "region_id"],
-                                      search_params={"metric_type": "IP", "params": state().get("search_params", {})})[0]
+            for q_vec in query_vecs:
+                rows = service.search(
+                    collection_name=collection,
+                    data=[q_vec],
+                    anns_field="embedding",
+                    limit=top_k,
+                    filter=f"region_id == {region}",
+                    output_fields=["keyframe_id", "video_id", "shot_id", "frame_id", "timestamp", "image_path", "region_id"],
+                    search_params={"metric_type": "IP", "params": state().get("search_params", {})},
+                )[0]
                 region_hits.extend(to_hit(row) for row in rows)
             by_region.append(region_hits)
         output.append(condition_best(by_region))
@@ -125,18 +242,66 @@ def run_conditions(conditions: list[Condition], top_k: int, expand: bool) -> lis
 
 
 def search(request: SearchRequest) -> dict:
-    first = conjunction(run_conditions(request.conditions, request.top_k, request.expand), [item.weight for item in request.conditions])
+    if use_local_engine():
+        engine = local_engine()
+        cond_texts = [resolve_condition_texts(cond, request.expand) for cond in request.conditions]
+        flat_texts = [t for sublist in cond_texts for t in sublist]
+        flat_vecs = encoder().texts(flat_texts)
+        vec_map = dict(zip(flat_texts, flat_vecs))
+        evaluated: list[tuple[tuple[int, ...], list[list[float]], float, int]] = []
+        for cond, texts in zip(request.conditions, cond_texts):
+            q_vecs = [vec_map[t] for t in texts]
+            evaluated.append((region_ids(cond.region), q_vecs, cond.weight, cond.stage))
+        allowed_vids = engine.resolve_allowed_videos(request.video_filter)
+        return engine.search_conditions(
+            evaluated_conditions=evaluated,
+            top_k=request.top_k,
+            result_limit=request.result_limit,
+            diversify=request.diversify,
+            max_temporal_gap=request.max_temporal_gap,
+            allowed_videos=allowed_vids,
+        )
+
+    first = conjunction(
+        run_conditions(request.conditions, request.top_k, request.expand),
+        [item.weight for item in request.conditions],
+    )
     results = diversify_by_shot(first, request.result_limit) if request.diversify else first[:request.result_limit]
     return {"kind": "frames", "results": results, "raw_count": len(first)}
 
 
 app = FastAPI(title="Spatial KIS")
-app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:8010"], allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+
+@app.on_event("startup")
+def _warmup_models() -> None:
+    import threading
+    from .expander import expander as get_expander
+
+    def _bg() -> None:
+        try:
+            get_expander()
+            encoder()
+            csv_engine()
+            if use_local_engine():
+                eng = local_engine()
+                eng._region_tensor_fp32(0)
+        except Exception:
+            pass
+
+    threading.Thread(target=_bg, daemon=True).start()
 
 
 @app.get("/health")
 def health() -> dict:
-    return {"ok": True, "artifact": str(ARTIFACT), "collection": state()["active_collection"]}
+    backend = "local_memmap" if use_local_engine() else "milvus"
+    return {
+        "ok": True,
+        "backend": backend,
+        "artifact": str(ARTIFACT),
+        "collection": state().get("active_collection", backend),
+    }
 
 
 @app.post("/api/search")
@@ -148,22 +313,180 @@ def search_endpoint(request: SearchRequest) -> dict:
     return result
 
 
+@app.get("/api/neighbors")
+def neighbors_endpoint(
+    video_id: str = Query(...),
+    timestamp: float = Query(default=0.0),
+    window: float = Query(default=30.0, ge=2.0, le=300.0),
+) -> dict:
+    engine = local_engine()
+    items = engine.video_neighbors(video_id=video_id, timestamp=timestamp, window_seconds=window, limit=30)
+    return {"video_id": video_id, "video_stem": clean_video_name(video_id), "neighbors": items}
+
+
 @app.post("/api/expand")
 def expand_endpoint(condition: Condition) -> dict:
     return {"original": condition.text, "variants": variants(condition.text)}
 
 
+@app.get("/api/csv/status")
+def csv_status_endpoint() -> dict:
+    return csv_engine().status()
+
+
+@app.post("/api/csv/search")
+def csv_search_endpoint(req: CsvSearchRequest) -> dict:
+    try:
+        engine = local_engine() if use_local_engine() else None
+    except Exception:
+        engine = None
+    allowed_videos: set[str] | None = None
+    if req.video_filter is not None:
+        if engine is not None:
+            resolved = engine.resolve_allowed_videos(req.video_filter)
+            allowed_videos = set() if resolved is None else resolved
+        else:
+            allowed_videos = {
+                clean_video_name(part.strip()).upper()
+                for item in req.video_filter
+                for part in item.replace(";", ",").replace(" ", ",").split(",")
+                if part.strip()
+            }
+    res = csv_engine().search(req.query, limit=req.limit, allowed_videos=allowed_videos)
+    matches = res.get("matches") or []
+    if matches:
+        for m in matches:
+            if not m.get("image_path") and engine is not None:
+                nbs = engine.video_neighbors(
+                    video_id=m["video_id"],
+                    timestamp=float(m.get("timestamp") or 0.0),
+                    window_seconds=10.0,
+                    limit=1,
+                )
+                if nbs:
+                    m["image_path"] = nbs[0]["image_path"]
+                    if m.get("frame_id") is None:
+                        m["frame_id"] = nbs[0]["frame_id"]
+    return res
+
+
+@app.post("/api/csv/upload")
+def csv_upload_endpoint(req: CsvUploadRequest) -> dict:
+    import re
+
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", Path(req.filename).name)
+    if not safe_name.lower().endswith(".csv"):
+        safe_name += ".csv"
+    target = ARTIFACT / safe_name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(req.content, encoding="utf-8")
+    csv_engine().reload_if_needed(force=True)
+    return {"ok": True, "saved_as": safe_name, **csv_engine().status()}
+
+
 @app.post("/api/feedback")
 def feedback(request: Feedback) -> dict:
-    # Session-local UI consumes this acknowledgement; it intentionally never modifies the model or index.
+    HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
     with HISTORY_PATH.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps({"feedback": request.model_dump()}, ensure_ascii=False) + "\n")
     return {"ok": True}
 
 
+def _dres_json_request(url: str, method: str = "GET", payload: dict | None = None) -> dict | list:
+    headers = {"Accept": "application/json"}
+    data = None
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            raw = resp.read().decode("utf-8")
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as err:
+        detail = err.read().decode("utf-8", errors="replace")
+        raise HTTPException(status_code=err.code, detail=f"DRES HTTP {err.code}: {detail}") from err
+    except Exception as err:
+        raise HTTPException(status_code=502, detail=f"DRES connection error: {err}") from err
+
+
+@app.post("/api/dres/login")
+def dres_login(req: DresLoginRequest) -> dict:
+    base = req.base_url.rstrip("/")
+    login_data = _dres_json_request(
+        f"{base}/api/v2/login",
+        method="POST",
+        payload={"username": req.username, "password": req.password},
+    )
+    assert isinstance(login_data, dict)
+    session_id = login_data.get("sessionId")
+    evaluations: list = []
+    if session_id:
+        try:
+            eval_res = _dres_json_request(
+                f"{base}/api/v2/client/evaluation/list?session={urllib.parse.quote(str(session_id))}",
+                method="GET",
+            )
+            if isinstance(eval_res, list):
+                evaluations = eval_res
+        except Exception:
+            pass
+    return {"login": login_data, "sessionId": session_id, "evaluations": evaluations}
+
+
+@app.get("/api/dres/evaluations")
+def dres_evaluations(base_url: str = Query("https://eventretrieval.one"), session_id: str = Query(...)) -> dict:
+    base = base_url.rstrip("/")
+    eval_res = _dres_json_request(
+        f"{base}/api/v2/client/evaluation/list?session={urllib.parse.quote(session_id)}",
+        method="GET",
+    )
+    return {"evaluations": eval_res if isinstance(eval_res, list) else []}
+
+
+@app.post("/api/dres/submit")
+def dres_submit(req: DresSubmitRequest) -> dict:
+    base = req.base_url.rstrip("/")
+    video_stem = clean_video_name(req.video_id)
+    start_ms = int(req.start_ms)
+    end_ms = int(req.end_ms if req.end_ms is not None else start_ms)
+
+    if req.mode == "qa":
+        answer_text = (req.qa_answer or "").strip()
+        if not answer_text:
+            raise HTTPException(400, "QA mode requires qa_answer")
+        formatted_qa = f"{answer_text}-{video_stem}-{start_ms}"
+        body = {"answerSets": [{"answers": [{"text": formatted_qa}]}]}
+    else:
+        body = {
+            "answerSets": [
+                {
+                    "answers": [
+                        {
+                            "mediaItemName": video_stem,
+                            "start": start_ms,
+                            "end": end_ms,
+                        }
+                    ]
+                }
+            ]
+        }
+
+    url = f"{base}/api/v2/submit/{urllib.parse.quote(req.evaluation_id)}?session={urllib.parse.quote(req.session_id)}"
+    response = _dres_json_request(url, method="POST", payload=body)
+    HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with HISTORY_PATH.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps({"dres_submit": req.model_dump(), "payload": body, "response": response}, ensure_ascii=False)
+            + "\n"
+        )
+    return {"ok": True, "payload": body, "dres_response": response}
+
+
 @app.get("/media/keyframe/{path:path}")
 def keyframe_path(path: str):
     from fastapi.responses import FileResponse
+
     target = (ARTIFACT / "images" / path).resolve()
     root = (ARTIFACT / "images").resolve()
     if root not in target.parents or not target.is_file():
@@ -174,13 +497,26 @@ def keyframe_path(path: str):
 @app.get("/media/video/{video_id:path}")
 def video_path(video_id: str):
     from fastapi.responses import FileResponse
-    target = (VIDEO_ROOT / video_id).resolve()
-    if not target.is_file() and not video_id.endswith(".mp4"):
-        target = (VIDEO_ROOT / f"{video_id}.mp4").resolve()
+
+    stem = clean_video_name(video_id)
+    candidates = [
+        VIDEO_ROOT / video_id,
+        VIDEO_ROOT / f"{video_id}.mp4",
+        VIDEO_ROOT / f"{stem}.mp4",
+        VIDEO_ROOT / stem.split("_")[0] / f"{stem}.mp4",
+        VIDEO_ROOT / "videos" / f"{stem}.mp4",
+    ]
     root = VIDEO_ROOT.resolve()
-    if root not in target.parents or not target.is_file():
-        raise HTTPException(404, f"Video not found: {video_id}")
-    return FileResponse(target, media_type="video/mp4")
+    for candidate in candidates:
+        if candidate.is_file():
+            target = candidate.resolve()
+            if root in target.parents or target.parent == root:
+                return FileResponse(target, media_type="video/mp4")
+    # Recursive fallback inside VIDEO_ROOT if nested in L01..L30 subfolder
+    matches = list(root.rglob(f"{stem}.mp4"))
+    if matches:
+        return FileResponse(matches[0].resolve(), media_type="video/mp4")
+    raise HTTPException(404, f"Video not found: {video_id}")
 
 
 WEB = Path(__file__).parents[2] / "web"
