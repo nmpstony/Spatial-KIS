@@ -67,6 +67,7 @@ class SearchRequest(BaseModel):
 class CsvSearchRequest(BaseModel):
     query: str = ""
     limit: int = Field(default=80, ge=1, le=500)
+    video_filter: list[str] | None = None
 
 
 class CsvUploadRequest(BaseModel):
@@ -334,13 +335,25 @@ def csv_status_endpoint() -> dict:
 
 @app.post("/api/csv/search")
 def csv_search_endpoint(req: CsvSearchRequest) -> dict:
-    res = csv_engine().search(req.query, limit=req.limit)
+    try:
+        engine = local_engine() if use_local_engine() else None
+    except Exception:
+        engine = None
+    allowed_videos: set[str] | None = None
+    if req.video_filter is not None:
+        if engine is not None:
+            resolved = engine.resolve_allowed_videos(req.video_filter)
+            allowed_videos = set() if resolved is None else resolved
+        else:
+            allowed_videos = {
+                clean_video_name(part.strip()).upper()
+                for item in req.video_filter
+                for part in item.replace(";", ",").replace(" ", ",").split(",")
+                if part.strip()
+            }
+    res = csv_engine().search(req.query, limit=req.limit, allowed_videos=allowed_videos)
     matches = res.get("matches") or []
     if matches:
-        try:
-            engine = local_engine()
-        except Exception:
-            engine = None
         for m in matches:
             if not m.get("image_path") and engine is not None:
                 nbs = engine.video_neighbors(

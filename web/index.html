@@ -7,7 +7,7 @@
   <meta http-equiv="Pragma" content="no-cache">
   <meta http-equiv="Expires" content="0">
   <title>Spatial KIS — Hệ thống Truy vấn & Nộp bài DRES</title>
-  <link rel="stylesheet" href="/style.css?v=7.0">
+  <link rel="stylesheet" href="/style.css?v=8.0">
 </head>
 <body>
 <main>
@@ -57,10 +57,10 @@
     <div id="dres-status" class="dres-status">Chưa đăng nhập DRES (Có thể tìm kiếm bình thường hoặc nhập tài khoản để nộp bài trực tiếp).</div>
   </section>
 
-  <!-- CSV / OCR Proper Noun Search & Video Intersection Panel -->
+  <!-- Optional Pre-Search Video Scope & CSV Status Panel -->
   <section class="csv-panel">
     <div class="csv-header-row">
-      <span class="csv-title">🔤 Tìm Tên Riêng / Chữ OCR qua CSV &amp; Giao (∩) Mã Video với Tìm Hình Ảnh</span>
+      <span class="csv-title">📂 Kho dữ liệu OCR (.CSV) &amp; Giới hạn cụm Video trước khi tìm (Tùy chọn)</span>
       <div class="csv-file-actions">
         <span id="csv-meta-badge" class="csv-meta-badge">Đang kiểm tra file CSV trên server...</span>
         <input id="csv-file-input" type="file" accept=".csv,.tsv,.txt" style="display:none;">
@@ -68,32 +68,20 @@
       </div>
     </div>
 
-    <div class="csv-grid">
-      <div class="csv-col">
-        <label>1️⃣ Nhập Tên riêng / Từ khóa cần tìm trong CSV (OCR / Phụ đề)</label>
-        <div class="csv-input-group">
-          <input id="csv-query-input" type="text" placeholder="VD: Tuyên Quang, Baleia Jubarte, Thanh Hóa (nhấn Enter hoặc bấm Tìm)...">
-          <button id="csv-search-btn" type="button" class="btn-csv-search">🔎 Lọc Mã Video từ CSV</button>
-        </div>
-      </div>
-
-      <div class="csv-col">
-        <label>
-          <input id="use-video-filter" type="checkbox" checked>
-          2️⃣ Danh sách Mã Video đem GIAO (∩) với Tìm kiếm Hình ảnh (chỉ chấm điểm các video này)
-        </label>
-        <div class="csv-input-group">
-          <input id="video-filter-input" type="text" placeholder="Tự động điền từ CSV hoặc nhập tay: VD: L20_V006, L15_V010 hoặc L21-L24...">
-          <button id="filter-l21-l24-btn" type="button" class="btn-secondary" title="Chỉ tìm trong cụm video L21 đến L24">⚡ Chỉ L21–L24</button>
-          <button id="filter-clear-btn" type="button" class="btn-danger" title="Xoá bộ lọc mã video để tìm lại trên toàn bộ 726 video">✕ Xoá lọc</button>
-        </div>
+    <div class="csv-col">
+      <label>
+        <input id="use-video-filter" type="checkbox" checked>
+        Giới hạn trước theo Mã Video / Cụm Batch (Bỏ trống = tìm toàn bộ corpus; VD: L21-L24, L20_V006)
+      </label>
+      <div class="csv-input-group">
+        <input id="video-filter-input" type="text" placeholder="Tùy chọn nhập tay mã video hoặc cụm batch: VD: L21-L24 hoặc L20_V006, L15_V010...">
+        <button id="filter-l21-l24-btn" type="button" class="btn-secondary" title="Chỉ tìm trong cụm video L21 đến L24">⚡ Chỉ L21–L24</button>
+        <button id="filter-clear-btn" type="button" class="btn-danger" title="Xoá giới hạn mã video để tìm lại trên toàn bộ video">✕ Xoá giới hạn</button>
       </div>
     </div>
-
-    <div id="csv-results-bar" class="csv-results-bar" style="display:none;"></div>
   </section>
 
-  <h3>Các Cảnh tìm kiếm bằng Hình ảnh (Nhấn Enter để tìm nhanh)</h3>
+  <h3>1️⃣ Các Cảnh tìm kiếm bằng Hình ảnh (Nhấn Enter để tìm nhanh)</h3>
   <section id="scenes-container"></section>
 
   <div class="controls-row">
@@ -107,9 +95,23 @@
   </div>
 
   <div class="search-bar-row">
-    <button id="search">🔍 Bắt đầu Tìm kiếm (Enter)</button>
+    <button id="search">🔍 Bắt đầu Tìm kiếm Cảnh (Enter)</button>
     <span id="status"></span>
   </div>
+
+  <!-- Post-Search OCR Filter Panel (runs AFTER visual search on matched videos) -->
+  <section id="post-ocr-panel" class="csv-panel post-ocr-panel">
+    <div class="csv-header-row" style="margin-bottom:6px;">
+      <span class="csv-title">🔤 2️⃣ Lọc OCR sau khi tìm Cảnh (Chỉ lọc trực tiếp trên các Video vừa tìm được)</span>
+      <span id="ocr-candidate-badge" class="ocr-candidate-badge">⚠ Chưa có kết quả Cảnh — Hãy bấm "Bắt đầu Tìm kiếm Cảnh" trước</span>
+    </div>
+    <div class="csv-input-group">
+      <input id="csv-query-input" type="text" placeholder="Sau khi tìm Cảnh xong, nhập từ khóa OCR / tên riêng cần lọc (VD: Tuyên Quang, Baleia Jubarte)...">
+      <button id="csv-search-btn" type="button" class="btn-csv-search" disabled>🔎 Lọc OCR trên KQ Cảnh</button>
+      <button id="ocr-reset-filter-btn" type="button" class="btn-danger" style="display:none;" title="Bỏ lọc OCR để hiện lại toàn bộ kết quả Cảnh">✕ Bỏ lọc OCR</button>
+    </div>
+    <div id="csv-results-bar" class="csv-results-bar" style="display:none;"></div>
+  </section>
 
   <section id="ocr-results-section" class="ocr-results-section" style="display:none;"></section>
   <section id="results" class="results"></section>
@@ -150,6 +152,6 @@
   </div>
 </dialog>
 
-<script src="/app.js?v=7.0"></script>
+<script src="/app.js?v=8.0"></script>
 </body>
 </html>

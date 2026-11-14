@@ -89,6 +89,8 @@ def test_local_memmap_index_builds_and_searches():
         assert hit_acc["matches"][0]["timestamp_ms"] == 5000
         hit_no_acc = csv_eng.search("tuyen quang")
         assert hit_no_acc["video_ids"] == ["L01_V001"]
+        assert csv_eng.search("tuyen quang", allowed_videos={"L22_V011"})["video_ids"] == []
+        assert csv_eng.search("tuyen quang", allowed_videos={"L01_V001"})["video_ids"] == ["L01_V001"]
 
         # Test video_filter intersection
         allowed = idx.resolve_allowed_videos(["L01_V001"])

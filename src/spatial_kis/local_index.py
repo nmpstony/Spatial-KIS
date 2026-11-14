@@ -558,7 +558,12 @@ class CsvSearchEngine:
             "files": self.files_info,
         }
 
-    def search(self, query: str, limit: int = 80) -> dict:
+    def search(
+        self,
+        query: str,
+        limit: int = 80,
+        allowed_videos: set[str] | None = None,
+    ) -> dict:
         self.reload_if_needed()
         q_raw = query.strip()
         if not q_raw:
@@ -572,8 +577,16 @@ class CsvSearchEngine:
         video_row_counts: dict[str, int] = defaultdict(int)
         matched_snippets: list[dict] = []
         raw_cap = max(limit * 4, 200)
+        allowed_upper = (
+            {clean_video_name(v).upper() for v in allowed_videos}
+            if allowed_videos is not None
+            else None
+        )
 
         for r in self.rows:
+            stem = r["video_stem"]
+            if allowed_upper is not None and stem.upper() not in allowed_upper:
+                continue
             t_low = r["text_low"]
             t_norm = r["text_norm"]
             hit_idxs = [
@@ -581,7 +594,6 @@ class CsvSearchEngine:
                 if q_low in t_low or (q_norm and q_norm in t_norm)
             ]
             if hit_idxs:
-                stem = r["video_stem"]
                 video_term_hits[stem].update(hit_idxs)
                 video_row_counts[stem] += len(hit_idxs)
                 if len(matched_snippets) < raw_cap:

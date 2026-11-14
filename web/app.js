@@ -521,9 +521,12 @@ const filterL21L24Btn = document.querySelector('#filter-l21-l24-btn');
 const filterClearBtn = document.querySelector('#filter-clear-btn');
 const csvResultsBar = document.querySelector('#csv-results-bar');
 const ocrResultsSection = document.querySelector('#ocr-results-section');
+const ocrCandidateBadge = document.querySelector('#ocr-candidate-badge');
+const ocrResetFilterBtn = document.querySelector('#ocr-reset-filter-btn');
 
-let lastCsvQuery = '';
-let lastCsvMatches = [];
+let lastVisualResults = [];
+let lastVisualLatencyMs = 0;
+let activeOcrFilter = null; // { query, videoIds, videoSet, matchByVideo, matches }
 let ocrShowAll = false;
 
 function escapeHtml(str) {
@@ -542,8 +545,9 @@ const REGION_NAMES = {
 
 function createResultCard(item, opts = {}) {
   const isOcr = Boolean(opts.isOcr);
+  const ocrMatch = opts.ocrMatch || null;
   const card = document.createElement('article');
-  card.className = isOcr ? 'card ocr-card' : 'card';
+  card.className = isOcr ? 'card ocr-card' : (ocrMatch ? 'card ocr-matched-card' : 'card');
 
   const stem = item.video_stem || cleanVideoStem(item.video_id);
   const ms = item.timestamp_ms !== undefined ? item.timestamp_ms : Math.round((item.timestamp || 0) * 1000);
@@ -582,7 +586,9 @@ function createResultCard(item, opts = {}) {
 
   const ocrTextHtml = isOcr && item.text
     ? `<div class="ocr-text-snippet" title="${escapeHtml(item.text)}">${escapeHtml(item.text)}</div>`
-    : '';
+    : (ocrMatch && ocrMatch.text
+      ? `<div class="ocr-text-snippet" title="${escapeHtml(ocrMatch.text)}"><span class="ocr-badge">📝 OCR</span> ${ocrMatch.timestamp != null ? `${Number(ocrMatch.timestamp).toFixed(1)}s: ` : ''}${escapeHtml(ocrMatch.text)}</div>`
+      : '');
 
   card.innerHTML = `
     ${imgSrc ? `<img class="stage1-img" src="${imgSrc}" alt="${escapeHtml(item.keyframe_id || stem)}" loading="lazy" title="Bấm để xem video và các frame lân cận">` : ''}
@@ -709,8 +715,8 @@ if (csvUploadBtn && csvFileInput) {
       });
       if (r.ok) {
         await refreshCsvStatus();
-        if (csvQueryInput.value.trim()) {
-          await runCsvSearch(false);
+        if (csvQueryInput.value.trim() && lastVisualResults.length > 0) {
+          await runCsvSearch();
         }
       } else {
         csvMetaBadge.textContent = `❌ Lỗi nạp CSV (${r.status})`;
@@ -723,44 +729,116 @@ if (csvUploadBtn && csvFileInput) {
   };
 }
 
-async function runCsvSearch(triggerVisualSearch = false) {
+function getVisualCandidateVideos() {
+  const seen = new Set();
+  for (const item of lastVisualResults) {
+    const stem = (item.video_stem || cleanVideoStem(item.video_id)).toUpperCase();
+    if (stem) seen.add(stem);
+  }
+  return [...seen];
+}
+
+function updatePostOcrUi() {
+  const candidateVids = getVisualCandidateVideos();
+  if (csvSearchBtn) {
+    csvSearchBtn.disabled = candidateVids.length === 0;
+  }
+  if (ocrResetFilterBtn) {
+    ocrResetFilterBtn.style.display = activeOcrFilter ? 'inline-block' : 'none';
+  }
+  if (ocrCandidateBadge) {
+    if (candidateVids.length === 0) {
+      ocrCandidateBadge.textContent = '⚠ Chưa có kết quả Cảnh — Hãy bấm "Bắt đầu Tìm kiếm Cảnh" trước';
+      ocrCandidateBadge.style.color = '#ffd33d';
+    } else if (activeOcrFilter) {
+      ocrCandidateBadge.textContent = `🔍 Đang lọc OCR "${activeOcrFilter.query}": giữ ${activeOcrFilter.videoIds.length}/${candidateVids.length} video`;
+      ocrCandidateBadge.style.color = '#7ee787';
+    } else {
+      ocrCandidateBadge.textContent = `✅ Sẵn sàng lọc trên ${candidateVids.length} video (${lastVisualResults.length} kết quả Cảnh)`;
+      ocrCandidateBadge.style.color = '#79c0ff';
+    }
+  }
+}
+
+function renderVisualResults() {
+  results.innerHTML = '';
+  if (!lastVisualResults.length) {
+    return;
+  }
+  const candidateVids = getVisualCandidateVideos();
+  if (activeOcrFilter) {
+    const filtered = lastVisualResults.filter((item) => {
+      const stem = (item.video_stem || cleanVideoStem(item.video_id)).toUpperCase();
+      return activeOcrFilter.videoSet.has(stem);
+    });
+    for (const item of filtered) {
+      const stem = (item.video_stem || cleanVideoStem(item.video_id)).toUpperCase();
+      results.append(createResultCard(item, { isOcr: false, ocrMatch: activeOcrFilter.matchByVideo[stem] || null }));
+    }
+    status.textContent = `🔍 Lọc OCR "${activeOcrFilter.query}": còn ${filtered.length}/${lastVisualResults.length} kết quả Cảnh (${activeOcrFilter.videoIds.length}/${candidateVids.length} video)`;
+  } else {
+    for (const item of lastVisualResults) {
+      results.append(createResultCard(item, { isOcr: false }));
+    }
+    status.textContent = `✅ Hiển thị ${lastVisualResults.length} kết quả Cảnh từ ${candidateVids.length} video (${lastVisualLatencyMs} ms)`;
+  }
+}
+
+function resetOcrFilter() {
+  activeOcrFilter = null;
+  if (csvResultsBar) csvResultsBar.style.display = 'none';
+  renderOcrMatchesSection('', [], 0);
+  renderVisualResults();
+  updatePostOcrUi();
+}
+
+async function runCsvSearch() {
   const q = csvQueryInput ? csvQueryInput.value.trim() : '';
-  if (!q) {
-    lastCsvQuery = '';
-    lastCsvMatches = [];
-    if (csvResultsBar) csvResultsBar.style.display = 'none';
-    renderOcrMatchesSection('', [], 0);
+  const candidateVids = getVisualCandidateVideos();
+
+  if (candidateVids.length === 0) {
+    if (csvResultsBar) {
+      csvResultsBar.style.display = 'block';
+      csvResultsBar.innerHTML = `<span style="color:#ffd33d">⚠ Thao tác lọc OCR chỉ chạy <b>SAU khi tìm bằng Cảnh</b>. Hãy nhập mô tả cảnh và bấm <b>🔍 Bắt đầu Tìm kiếm Cảnh</b> trước!</span>`;
+    }
+    updatePostOcrUi();
     return [];
   }
+
+  if (!q) {
+    resetOcrFilter();
+    return [];
+  }
+
   try {
     const r = await fetch('/api/csv/search', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query: q, limit: 80 })
+      body: JSON.stringify({ query: q, limit: 120, video_filter: candidateVids })
     });
     if (!r.ok) return [];
     const data = await r.json();
     const vids = data.video_ids || [];
-    lastCsvQuery = q;
-    lastCsvMatches = data.matches || [];
+    const matches = data.matches || [];
+    const videoSet = new Set(vids.map((v) => String(v).toUpperCase()));
+    const matchByVideo = {};
+    for (const m of matches) {
+      const st = String(m.video_id || '').toUpperCase();
+      if (st && !matchByVideo[st]) matchByVideo[st] = m;
+    }
     ocrShowAll = false;
-    if (videoFilterInput) {
-      videoFilterInput.value = vids.join(', ');
-    }
-    if (useVideoFilterChk && vids.length > 0) {
-      useVideoFilterChk.checked = true;
-    }
+    activeOcrFilter = { query: q, videoIds: vids, videoSet, matchByVideo, matches };
+
     if (csvResultsBar) {
       csvResultsBar.style.display = 'block';
       if (data.total_rows === 0) {
-        csvResultsBar.innerHTML = `<span style="color:#ffd33d">⚠ Trên server chưa có dữ liệu CSV nào. Hãy bấm nút <b>📂 Nạp file .CSV lên Server</b> ở góc phải!</span>`;
+        csvResultsBar.innerHTML = `<span style="color:#ffd33d">⚠ Trên server chưa có dữ liệu CSV nào. Hãy bấm nút <b>📂 Nạp file .CSV lên Server</b>!</span>`;
         renderOcrMatchesSection('', [], 0);
       } else if (vids.length === 0) {
-        csvResultsBar.innerHTML = `<span style="color:#ff7b72">❌ Không tìm thấy từ khóa <b>"${escapeHtml(q)}"</b> trong ${data.total_rows} dòng CSV. (Tạm tắt lọc giao để không bị trống kết quả)</span>`;
-        if (useVideoFilterChk) useVideoFilterChk.checked = false;
+        csvResultsBar.innerHTML = `<span style="color:#ff7b72">❌ Không tìm thấy từ khóa OCR <b>"${escapeHtml(q)}"</b> trong ${candidateVids.length} video vừa tìm được bằng Cảnh. (Bấm <b>✕ Bỏ lọc OCR</b> để khôi phục)</span>`;
         renderOcrMatchesSection('', [], 0);
       } else {
-        const chipsHtml = lastCsvMatches
+        const chipsHtml = matches
           .slice(0, 25)
           .map((m, idx) => {
             const tsLabel = m.timestamp != null ? ` @ ${Number(m.timestamp).toFixed(1)}s` : m.frame_id != null ? ` #${m.frame_id}` : '';
@@ -769,11 +847,11 @@ async function runCsvSearch(triggerVisualSearch = false) {
           })
           .join('');
         csvResultsBar.innerHTML =
-          `<div style="margin-bottom:4px; color:#7ee787;">✅ Tìm thấy <b>${vids.length} mã video</b> khớp từ khóa <b>"${escapeHtml(q)}"</b> (Đã điền vào ô Giao ∩ &amp; hiển thị các frame khớp OCR bên dưới):</div>` +
+          `<div style="margin-bottom:4px; color:#7ee787;">✅ Đã lọc trực tiếp trên ${candidateVids.length} video kết quả Cảnh → còn <b>${vids.length} video</b> khớp OCR <b>"${escapeHtml(q)}"</b>:</div>` +
           `<div>${chipsHtml}</div>`;
         csvResultsBar.querySelectorAll('.csv-snippet-chip').forEach((chip) => {
           chip.onclick = () => {
-            const m = lastCsvMatches[Number(chip.dataset.idx)];
+            const m = matches[Number(chip.dataset.idx)];
             if (m) {
               inspectResult({
                 video_id: m.video_id,
@@ -787,12 +865,11 @@ async function runCsvSearch(triggerVisualSearch = false) {
             }
           };
         });
-        renderOcrMatchesSection(q, lastCsvMatches, vids.length);
+        renderOcrMatchesSection(q, matches, vids.length);
       }
     }
-    if (triggerVisualSearch && getConditions().length > 0) {
-      await runSearch(true);
-    }
+    renderVisualResults();
+    updatePostOcrUi();
     return vids;
   } catch (_) {
     return [];
@@ -800,13 +877,17 @@ async function runCsvSearch(triggerVisualSearch = false) {
 }
 
 if (csvSearchBtn) {
-  csvSearchBtn.onclick = () => runCsvSearch(true);
+  csvSearchBtn.onclick = () => runCsvSearch();
+}
+if (ocrResetFilterBtn) {
+  ocrResetFilterBtn.onclick = () => resetOcrFilter();
 }
 if (csvQueryInput) {
   csvQueryInput.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') {
       e.preventDefault();
-      runCsvSearch(true);
+      e.stopPropagation();
+      runCsvSearch();
     }
   });
 }
@@ -814,30 +895,21 @@ if (filterL21L24Btn) {
   filterL21L24Btn.onclick = () => {
     videoFilterInput.value = 'L21-L24';
     useVideoFilterChk.checked = true;
-    if (getConditions().length > 0) runSearch(true);
+    if (getConditions().length > 0) runSearch();
   };
 }
 if (filterClearBtn) {
   filterClearBtn.onclick = () => {
     videoFilterInput.value = '';
-    lastCsvQuery = '';
-    lastCsvMatches = [];
-    if (csvQueryInput) csvQueryInput.value = '';
-    if (csvResultsBar) csvResultsBar.style.display = 'none';
-    renderOcrMatchesSection('', [], 0);
-    if (getConditions().length > 0) runSearch(true);
+    if (getConditions().length > 0) runSearch();
   };
 }
+updatePostOcrUi();
 
-async function runSearch(skipAutoCsv = false) {
+async function runSearch() {
   const isAutoExpand = document.querySelector('#expand').checked;
   const isDiversify = document.querySelector('#diversify').checked;
   const maxTemporalGap = Number(document.querySelector('#temporal-gap').value) || 45.0;
-
-  const csvQ = csvQueryInput ? csvQueryInput.value.trim() : '';
-  if (!skipAutoCsv && csvQ && (csvQ !== lastCsvQuery || (videoFilterInput && !videoFilterInput.value.trim()))) {
-    await runCsvSearch(false);
-  }
 
   if (isAutoExpand) {
     const wrappers = [...document.querySelectorAll('.condition-wrapper')];
@@ -883,12 +955,18 @@ async function runSearch(skipAutoCsv = false) {
 
   status.textContent = '⏳ Đang truy vấn trên 633,600 keyframes...';
   results.innerHTML = '';
+  lastVisualResults = [];
+  activeOcrFilter = null;
+  if (csvResultsBar) csvResultsBar.style.display = 'none';
+  renderOcrMatchesSection('', [], 0);
+  updatePostOcrUi();
 
   const activeFilterStr =
     useVideoFilterChk && useVideoFilterChk.checked && videoFilterInput ? videoFilterInput.value.trim() : '';
 
   const request = {
     conditions: c,
+    result_limit: 120,
     diversify: isDiversify,
     expand: isAutoExpand,
     max_temporal_gap: maxTemporalGap,
@@ -917,11 +995,11 @@ async function runSearch(skipAutoCsv = false) {
       return;
     }
 
-    status.textContent = `✅ Hiển thị ${data.results.length} kết quả tốt nhất (${lat} ms)`;
-
-    for (const item of data.results) {
-      results.append(createResultCard(item, { isOcr: false }));
-    }
+    lastVisualResults = data.results || [];
+    lastVisualLatencyMs = lat;
+    activeOcrFilter = null;
+    renderVisualResults();
+    updatePostOcrUi();
   } catch (err) {
     status.textContent = '❌ Lỗi kết nối máy chủ: ' + err.message;
   }

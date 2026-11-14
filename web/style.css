@@ -575,3 +575,24 @@ dialog video {
   font-size: 10.5px;
   font-weight: 700;
 }
+.post-ocr-panel {
+  margin-top: 8px;
+  margin-bottom: 14px;
+  border-color: #388bfd;
+}
+.ocr-candidate-badge {
+  font-size: 12px;
+  padding: 3px 9px;
+  border-radius: 5px;
+  background: #0d1117;
+  border: 1px solid #30363d;
+  color: #ffd33d;
+}
+.btn-csv-search:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.card.ocr-matched-card {
+  border-color: #ffdf5d;
+  box-shadow: 0 0 0 1px rgba(255, 223, 93, 0.25);
+}
