@@ -580,14 +580,15 @@ function createResultCard(item, opts = {}) {
       .join('');
   }
 
+  const ocrLabel = (item.match_type === 'fuzzy' || (ocrMatch && ocrMatch.match_type === 'fuzzy')) ? '📝 ~ OCR gần đúng' : '📝 Khớp OCR';
   const submetaHtml = isOcr
-    ? `<span class="ocr-badge">📝 Khớp OCR</span><span>${tsNum.toFixed(2)}s</span>${item.frame_id != null ? `<span>· #${item.frame_id}</span>` : ''}`
+    ? `<span class="ocr-badge">${ocrLabel}</span><span>${tsNum.toFixed(2)}s</span>${item.frame_id != null ? `<span>· #${item.frame_id}</span>` : ''}`
     : `<span>${tsNum.toFixed(2)}s</span><span>· #${item.frame_id}</span><span>· Score: <b>${Number(item.score || 0).toFixed(3)}</b></span><span class="card-tag">Vùng: <b>${REGION_NAMES[item.region_id] || item.region_id}</b></span>${nextTag}`;
 
   const ocrTextHtml = isOcr && item.text
     ? `<div class="ocr-text-snippet" title="${escapeHtml(item.text)}">${escapeHtml(item.text)}</div>`
     : (ocrMatch && ocrMatch.text
-      ? `<div class="ocr-text-snippet" title="${escapeHtml(ocrMatch.text)}"><span class="ocr-badge">📝 OCR</span> ${ocrMatch.timestamp != null ? `${Number(ocrMatch.timestamp).toFixed(1)}s: ` : ''}${escapeHtml(ocrMatch.text)}</div>`
+      ? `<div class="ocr-text-snippet" title="${escapeHtml(ocrMatch.text)}"><span class="ocr-badge">${ocrMatch.match_type === 'fuzzy' ? '📝 ~ OCR gần đúng' : '📝 OCR'}</span> ${ocrMatch.timestamp != null ? `${Number(ocrMatch.timestamp).toFixed(1)}s: ` : ''}${escapeHtml(ocrMatch.text)}</div>`
       : '');
 
   card.innerHTML = `
@@ -663,6 +664,7 @@ function renderOcrMatchesSection(query, matches, videoCount) {
       timestamp_ms: m.timestamp_ms != null ? m.timestamp_ms : (m.timestamp != null ? Math.round(Number(m.timestamp) * 1000) : 0),
       image_path: m.image_path || (m.frame_id != null ? `images/${m.video_id}/frame_${m.frame_id}.webp` : ''),
       text: m.text || '',
+      match_type: m.match_type || 'exact',
       score: 1.0,
     };
     grid.append(createResultCard(item, { isOcr: true }));

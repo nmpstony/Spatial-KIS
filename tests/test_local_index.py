@@ -92,6 +92,25 @@ def test_local_memmap_index_builds_and_searches():
         assert csv_eng.search("tuyen quang", allowed_videos={"L22_V011"})["video_ids"] == []
         assert csv_eng.search("tuyen quang", allowed_videos={"L01_V001"})["video_ids"] == ["L01_V001"]
 
+        # Test OCR-tolerant & fuzzy matching for noisy Vietnamese OCR text
+        noisy_csv = (
+            "video_id,frame_id,timestamp,text\n"
+            "L01_V001,100,5.0,Thành phố Sầm Sơn\n"
+            "L23_V007,7679,307.16,Đích @ld Sam Sđn (Thonh Hoa)\n"
+            "L23_V022,7355,294.2,MUMG 70 Nom DIEN Vien Puui7s\n"
+            "L23_V013,6348,253.92,Đà Nẵng - Jam Kỳ (Quang Nam)\n"
+            "L02_V001,10,1.0,Bản tin be nhỏ\n"
+        )
+        (root / "ocr.csv").write_text(noisy_csv, encoding="utf-8")
+        csv_eng.reload_if_needed(force=True)
+        sam_son = csv_eng.search("Sầm Sơn")
+        assert sam_son["video_ids"] == ["L01_V001", "L23_V007"]
+        assert sam_son["matches"][0]["match_type"] == "exact"
+        assert "L23_V007" in csv_eng.search("Thanh Hóa")["video_ids"]
+        assert "L23_V022" in csv_eng.search("Điện Biên")["video_ids"]
+        assert "L23_V013" in csv_eng.search("Tam Kỳ")["video_ids"]
+        assert csv_eng.search("xe")["video_ids"] == []
+
         # Test video_filter intersection
         allowed = idx.resolve_allowed_videos(["L01_V001"])
         assert allowed == {"L01_V001"}

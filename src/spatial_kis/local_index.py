@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import pickle
+import re
+import unicodedata
 from collections import defaultdict
 from functools import lru_cache
 from pathlib import Path
@@ -425,12 +427,148 @@ class LocalMemmapIndex:
         return nearby
 
 
-def strip_accents(text: str) -> str:
-    import unicodedata
+_OCR_CONFUSIONS = str.maketrans({
+    "0": "o",
+    "1": "l",
+    "3": "e",
+    "4": "a",
+    "5": "s",
+    "6": "g",
+    "8": "b",
+    "@": "a",
+    "$": "s",
+})
+_NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
+_NON_ALNUM_KEEP_PIPE_RE = re.compile(r"[^a-z0-9|]+")
 
+
+def strip_accents(text: str) -> str:
     text = text.replace("đ", "d").replace("Đ", "D")
     nfd = unicodedata.normalize("NFD", text)
     return "".join(ch for ch in nfd if unicodedata.category(ch) != "Mn").lower()
+
+
+def ocr_canonical(text: str) -> str:
+    """Normalize Vietnamese accents and common OCR digit/symbol confusions into clean space-separated tokens."""
+    norm = strip_accents(text).translate(_OCR_CONFUSIONS)
+    return _NON_ALNUM_RE.sub(" ", norm).strip()
+
+
+def _ocr_segments_and_text(text_norm: str) -> tuple[str, tuple[tuple[str, ...], ...]]:
+    translated = text_norm.translate(_OCR_CONFUSIONS)
+    clean_pipe = _NON_ALNUM_KEEP_PIPE_RE.sub(" ", translated)
+    segments = tuple(
+        toks
+        for seg in clean_pipe.split("|")
+        if (toks := tuple(seg.split()))
+    )
+    text_ocr = " ".join(" ".join(seg) for seg in segments)
+    return text_ocr, segments
+
+
+def _levenshtein_max(a: str, b: str, max_dist: int) -> int:
+    la, lb = len(a), len(b)
+    if abs(la - lb) > max_dist:
+        return max_dist + 1
+    if a == b:
+        return 0
+    if la > lb:
+        a, b = b, a
+        la, lb = lb, la
+    prev = list(range(la + 1))
+    for j, cb in enumerate(b, 1):
+        curr = [j]
+        min_row = j
+        for i, ca in enumerate(a, 1):
+            cost = 0 if ca == cb else 1
+            val = min(prev[i] + 1, curr[i - 1] + 1, prev[i - 1] + cost)
+            curr.append(val)
+            if val < min_row:
+                min_row = val
+        if min_row > max_dist:
+            return max_dist + 1
+        prev = curr
+    return prev[-1]
+
+
+def _make_trigrams(compact: str) -> tuple[str, ...]:
+    if len(compact) < 3:
+        return ()
+    return tuple({compact[i : i + 3] for i in range(len(compact) - 2)})
+
+
+def _fuzzy_phrase_match(
+    q_words: tuple[str, ...],
+    q_compact: str,
+    q_trigrams: tuple[str, ...],
+    row_segments: tuple[tuple[str, ...], ...],
+    row_compact: str,
+) -> float:
+    if not row_segments or len(q_compact) < 5:
+        return 0.0
+    if q_trigrams and not any(tg in row_compact for tg in q_trigrams):
+        return 0.0
+
+    k = len(q_words)
+    if k == 1:
+        qw = q_words[0]
+        ql = len(qw)
+        max_ed = 1 if ql <= 7 else 2
+        best = 0.0
+        for seg_tokens in row_segments:
+            for tok in seg_tokens:
+                if abs(len(tok) - ql) > max_ed:
+                    continue
+                d = _levenshtein_max(qw, tok, max_ed)
+                if d <= max_ed:
+                    score = 1.0 - (d / ql)
+                    if score > best:
+                        best = score
+        return best
+
+    q_len = len(q_compact)
+    max_total_ed = 1 if q_len <= 7 else (2 if q_len <= 11 else 3)
+    caps = tuple(0 if len(w) <= 2 else (1 if len(w) <= 7 else 2) for w in q_words)
+    qlens = tuple(len(w) for w in q_words)
+    qw0, ql0, cap0 = q_words[0], qlens[0], caps[0]
+    best = 0.0
+
+    for seg_tokens in row_segments:
+        n_tok = len(seg_tokens)
+        if n_tok < k:
+            continue
+        for i in range(n_tok - k + 1):
+            tok0 = seg_tokens[i]
+            if abs(len(tok0) - ql0) > cap0:
+                continue
+            total_len = len(tok0)
+            len_ok = True
+            for j in range(1, k):
+                tl = len(seg_tokens[i + j])
+                if abs(tl - qlens[j]) > caps[j]:
+                    len_ok = False
+                    break
+                total_len += tl
+            if not len_ok or abs(total_len - q_len) > max_total_ed:
+                continue
+
+            if _levenshtein_max(qw0, tok0, cap0) > cap0:
+                continue
+            word_ok = True
+            for j in range(1, k):
+                if _levenshtein_max(q_words[j], seg_tokens[i + j], caps[j]) > caps[j]:
+                    word_ok = False
+                    break
+            if not word_ok:
+                continue
+
+            win_compact = "".join(seg_tokens[i : i + k])
+            d = _levenshtein_max(q_compact, win_compact, max_total_ed)
+            if d <= max_total_ed:
+                score = 1.0 - (d / q_len)
+                if score > best:
+                    best = score
+    return best
 
 
 class CsvSearchEngine:
@@ -531,13 +669,18 @@ class CsvSearchEngine:
                         text_joined = " | ".join(text_parts)
                         if not text_joined:
                             continue
+                        text_norm = strip_accents(text_joined)
+                        text_ocr, row_segments = _ocr_segments_and_text(text_norm)
                         loaded_rows.append({
                             "video_stem": video_stem,
                             "frame_id": frame_id,
                             "timestamp": timestamp,
                             "text": text_joined,
                             "text_low": text_joined.lower(),
-                            "text_norm": strip_accents(text_joined),
+                            "text_norm": text_norm,
+                            "text_ocr": text_ocr,
+                            "text_compact": text_ocr.replace(" ", ""),
+                            "segments": row_segments,
                             "file": path.name,
                         })
                         file_rows += 1
@@ -563,6 +706,7 @@ class CsvSearchEngine:
         query: str,
         limit: int = 80,
         allowed_videos: set[str] | None = None,
+        fuzzy: bool = True,
     ) -> dict:
         self.reload_if_needed()
         q_raw = query.strip()
@@ -571,12 +715,21 @@ class CsvSearchEngine:
 
         # Split by comma or semicolon into multiple keywords
         terms_raw = [t.strip() for t in q_raw.replace(";", ",").split(",") if t.strip()]
-        terms = [(t.lower(), strip_accents(t)) for t in terms_raw]
+        terms = []
+        for t in terms_raw:
+            t_low = t.lower()
+            t_norm = strip_accents(t)
+            t_ocr = ocr_canonical(t)
+            q_words = tuple(t_ocr.split())
+            q_compact = "".join(q_words)
+            is_num = t_norm.replace(" ", "").isdigit()
+            terms.append((t_low, t_norm, t_ocr, q_words, q_compact, _make_trigrams(q_compact), is_num))
 
         video_term_hits: dict[str, set[int]] = defaultdict(set)
-        video_row_counts: dict[str, int] = defaultdict(int)
+        video_best_tier: dict[str, int] = defaultdict(int)
+        video_score_sums: dict[str, float] = defaultdict(float)
         matched_snippets: list[dict] = []
-        raw_cap = max(limit * 4, 200)
+        raw_cap = max(limit * 6, 360)
         allowed_upper = (
             {clean_video_name(v).upper() for v in allowed_videos}
             if allowed_videos is not None
@@ -589,16 +742,38 @@ class CsvSearchEngine:
                 continue
             t_low = r["text_low"]
             t_norm = r["text_norm"]
-            hit_idxs = [
-                ti for ti, (q_low, q_norm) in enumerate(terms)
-                if q_low in t_low or (q_norm and q_norm in t_norm)
-            ]
+            t_ocr = r["text_ocr"]
+            t_compact = r["text_compact"]
+            t_segments = r["segments"]
+
+            hit_idxs: list[int] = []
+            row_best_tier = 0
+            row_score = 0.0
+            for ti, (q_low, q_norm, q_ocr, q_words, q_compact, q_tri, is_num) in enumerate(terms):
+                if q_low in t_low or (q_norm and q_norm in t_norm):
+                    hit_idxs.append(ti)
+                    row_best_tier = max(row_best_tier, 3)
+                    row_score += 3.0
+                elif not is_num and q_ocr and q_ocr in t_ocr:
+                    hit_idxs.append(ti)
+                    row_best_tier = max(row_best_tier, 2)
+                    row_score += 2.0
+                elif fuzzy and not is_num:
+                    f_score = _fuzzy_phrase_match(q_words, q_compact, q_tri, t_segments, t_compact)
+                    if f_score > 0.0:
+                        hit_idxs.append(ti)
+                        row_best_tier = max(row_best_tier, 1)
+                        row_score += f_score
+
             if hit_idxs:
                 video_term_hits[stem].update(hit_idxs)
-                video_row_counts[stem] += len(hit_idxs)
-                if len(matched_snippets) < raw_cap:
+                if row_best_tier > video_best_tier[stem]:
+                    video_best_tier[stem] = row_best_tier
+                video_score_sums[stem] += row_score
+                if len(matched_snippets) < raw_cap or row_best_tier >= 2:
                     frame_id = r["frame_id"]
                     ts_val = r["timestamp"]
+                    match_type = "exact" if row_best_tier == 3 else ("ocr" if row_best_tier == 2 else "fuzzy")
                     matched_snippets.append({
                         "video_id": stem,
                         "frame_id": frame_id,
@@ -608,15 +783,26 @@ class CsvSearchEngine:
                         "text": r["text"][:220],
                         "file": r["file"],
                         "matched_terms": len(hit_idxs),
+                        "match_tier": row_best_tier,
+                        "match_score": round(row_score, 3),
+                        "match_type": match_type,
                     })
 
-        # If multiple terms were given, prefer videos that contain ALL terms (intersection across terms); fallback to most terms matched
+        # Prefer videos containing ALL terms, then exact > OCR-normalized > fuzzy, then hit count
         all_term_videos = [v for v, hits in video_term_hits.items() if len(hits) == len(terms)]
         target_videos = all_term_videos if all_term_videos else list(video_term_hits.keys())
-        target_videos.sort(key=lambda v: (len(video_term_hits[v]), video_row_counts[v], v), reverse=True)
+        target_videos.sort(
+            key=lambda v: (len(video_term_hits[v]), video_best_tier[v], video_score_sums[v], v),
+            reverse=True,
+        )
 
         target_set = set(target_videos)
-        filtered_snippets = [m for m in matched_snippets if m["video_id"] in target_set][:limit]
+        filtered_snippets = [m for m in matched_snippets if m["video_id"] in target_set]
+        filtered_snippets.sort(
+            key=lambda m: (m["matched_terms"], m["match_tier"], m["match_score"]),
+            reverse=True,
+        )
+        filtered_snippets = filtered_snippets[:limit]
 
         return {
             "query": q_raw,
