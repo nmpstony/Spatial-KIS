@@ -483,7 +483,7 @@ function getConditions() {
       const text = $('.query-text', wrapper)?.value.trim();
       const expanded = $('.expanded-input', wrapper)?.value.trim();
       if (!text && !expanded) return;
-      conditions.push({ text: expanded || text, region: $('.region-select', wrapper)?.value || 'all', weight: Number($('.weight-input', wrapper)?.value) || 1, stage: index + 1, variants: expanded && text && expanded !== text ? [text, expanded] : undefined });
+      conditions.push({ text: text || expanded, region: $('.region-select', wrapper)?.value || 'all', weight: Number($('.weight-input', wrapper)?.value) || 1, stage: Math.min(index + 1, 10), variants: expanded ? [expanded] : null });
     });
   });
   return conditions;
@@ -703,7 +703,7 @@ async function expandPendingConditions(generation) {
   await Promise.all(pending.map(async (wrapper) => {
     const query = $('.query-text', wrapper).value.trim();
     try {
-      const response = await fetch('/api/expand', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: query, region: 'all', weight: 1, stage: 1 }) });
+      const response = await fetch('/api/expand', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: query }) });
       const data = await response.json();
       if (response.ok && generation === visualGeneration) { const target = $('.expanded-input', wrapper); target.value = data.variants?.at(-1) || query; target.dataset.auto = 'true'; }
     } catch (_) {}
@@ -754,7 +754,12 @@ $('#search')?.addEventListener('click', runSearch);
 function temporalPreview(item) {
   const nextList = item.next_matches || item.next_stages || item.next_results || (item.next_match ? [item.next_match] : item.next ? [item.next] : []);
   if (!nextList.length) return { html: '', nextList };
-  const html = nextList.map((next, index) => `<div class="next-scene-box" data-next-index="${index}">${next.image_path ? `<img src="${imageUrl(next.image_path)}" alt="Next scene" loading="lazy">` : ''}<span>Scene ${next.stage || index + 2}<br>${formatTime(next.timestamp || 0)} · ${itemMs(next)} ms</span></div>`).join('');
+  const html = nextList.map((next, index) => {
+    const stage = next.stage || index + 2;
+    const ms = itemMs(next);
+    const frame = next.frame_id ?? Math.round(Number(next.timestamp || ms / 1000) * 25);
+    return `<div class="next-scene-box" data-next-index="${index}" role="button" tabindex="0" aria-label="Inspect scene ${stage} at ${ms} milliseconds">${next.image_path ? `<img src="${imageUrl(next.image_path)}" alt="Scene ${stage} keyframe at ${ms} ms" loading="lazy">` : '<div class="card-media audio-placeholder" role="img" aria-label="No keyframe available"></div>'}<div class="card-submeta scene-caption"><span class="card-tag next-tag">⏩ Scene ${stage}</span><span>${ms} ms</span><span>· #${escapeHtml(String(frame))}</span></div></div>`;
+  }).join('');
   return { html, nextList };
 }
 
@@ -777,10 +782,16 @@ function createResultCard(item, options = {}) {
   const textMatch = options.evidence ? item : evidenceMatch;
   const textClass = (textMatch?.source || source) === 'asr' ? 'asr-text-snippet' : '';
   const interval = source === 'asr' ? `${formatTime(timestamp, true)}–${formatTime(item.end_timestamp ?? timestamp, true)}` : `#${item.frame_id ?? Math.round(timestamp * 25)}`;
-  card.innerHTML = `${image ? `<img class="stage1-img" src="${image}" alt="${escapeHtml(stem)} at ${ms} ms" loading="lazy">` : `<div class="card-media audio-placeholder" role="img" aria-label="No keyframe available"></div>`}${preview.html}<div class="card-meta"><span class="video-pill">${escapeHtml(stem)}</span><span class="ms-pill">${ms} ms</span></div><div class="card-submeta"><span>${formatTime(timestamp)}</span><span>· ${escapeHtml(interval)}</span>${source === 'visual' ? `<span>· Score <b>${Number(item.score || 0).toFixed(3)}</b></span><span class="card-tag">${escapeHtml(REGION_NAMES[item.region_id] || item.region_id || 'all')}</span>` : `<span class="modality-badge ${source}">${source.toUpperCase()}</span><span>${escapeHtml(item.match_type || 'match')}</span>`}</div>${textMatch?.text ? `<div class="ocr-text-snippet ${textClass}">${escapeHtml(textMatch.text)}</div>` : ''}<div class="card-actions"><button type="button" class="view-btn">Inspect</button><button type="button" class="secondary-btn copy-btn">Copy</button></div><div class="card-submit-row"><button type="button" class="submit-kis kis-btn" data-submission="${escapeHtml(`${stem.toUpperCase()}|${ms}`)}">KIS</button><button type="button" class="submit-qa qa-btn" data-submission="${escapeHtml(`${stem.toUpperCase()}|${ms}`)}">Q&amp;A</button></div>`;
+  const primaryFrame = item.frame_id ?? Math.round(timestamp * 25);
+  const stage1Caption = preview.nextList.length ? `<div class="card-submeta scene-caption"><span class="card-tag">Scene 1</span><span>${ms} ms</span><span>· #${escapeHtml(String(primaryFrame))}</span></div>` : '';
+  card.innerHTML = `${image ? `<img class="stage1-img" src="${image}" alt="${escapeHtml(stem)} scene 1 at ${ms} ms" loading="lazy">` : `<div class="card-media audio-placeholder" role="img" aria-label="No keyframe available"></div>`}${stage1Caption}${preview.html}<div class="card-meta"><span class="video-pill">${escapeHtml(stem)}</span><span class="ms-pill">${ms} ms</span></div><div class="card-submeta"><span>${formatTime(timestamp)}</span><span>· ${escapeHtml(interval)}</span>${source === 'visual' ? `<span>· Score <b>${Number(item.score || 0).toFixed(3)}</b></span><span class="card-tag">${escapeHtml(REGION_NAMES[item.region_id] || item.region_id || 'all')}</span>` : `<span class="modality-badge ${source}">${source.toUpperCase()}</span><span>${escapeHtml(item.match_type || 'match')}</span>`}</div>${textMatch?.text ? `<div class="ocr-text-snippet ${textClass}">${escapeHtml(textMatch.text)}</div>` : ''}<div class="card-actions"><button type="button" class="view-btn">Inspect</button><button type="button" class="secondary-btn copy-btn">Copy</button></div><div class="card-submit-row"><button type="button" class="submit-kis kis-btn" data-submission="${escapeHtml(`${stem.toUpperCase()}|${ms}`)}">KIS</button><button type="button" class="submit-qa qa-btn" data-submission="${escapeHtml(`${stem.toUpperCase()}|${ms}`)}">Q&amp;A</button></div>`;
   $('.stage1-img', card)?.addEventListener('click', () => inspectResult(item));
   $('.view-btn', card).addEventListener('click', () => inspectResult(item));
-  $$('.next-scene-box', card).forEach((element) => element.addEventListener('click', () => { const next = preview.nextList[Number(element.dataset.nextIndex)]; if (next) inspectResult({ ...item, ...next }); }));
+  $$('.next-scene-box', card).forEach((element) => {
+    const inspectScene = () => { const next = preview.nextList[Number(element.dataset.nextIndex)]; if (next) inspectResult({ ...item, ...next }); };
+    element.addEventListener('click', inspectScene);
+    element.addEventListener('keydown', (event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); inspectScene(); } });
+  });
   $('.copy-btn', card).addEventListener('click', async () => { try { await copyPayload(stem, ms); card.classList.add('copied'); } catch (_) {} });
   $('.kis-btn', card).addEventListener('click', () => submitToDres(stem, ms, 'kis', card));
   $('.qa-btn', card).addEventListener('click', () => submitToDres(stem, ms, 'qa', card));
