@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -164,7 +166,12 @@ def local_engine() -> LocalMemmapIndex:
 
 @lru_cache
 def csv_engine() -> CsvSearchEngine:
-    return CsvSearchEngine(ARTIFACT)
+    return CsvSearchEngine(ARTIFACT, source="ocr")
+
+
+@lru_cache
+def asr_engine() -> CsvSearchEngine:
+    return CsvSearchEngine(ARTIFACT, source="asr")
 
 
 def use_local_engine() -> bool:
@@ -284,6 +291,7 @@ def _warmup_models() -> None:
             get_expander()
             encoder()
             csv_engine()
+            asr_engine()
             if use_local_engine():
                 eng = local_engine()
                 eng._region_tensor_fp32(0)
@@ -334,8 +342,7 @@ def csv_status_endpoint() -> dict:
     return csv_engine().status()
 
 
-@app.post("/api/csv/search")
-def csv_search_endpoint(req: CsvSearchRequest) -> dict:
+def _csv_search(engine_csv: CsvSearchEngine, req: CsvSearchRequest) -> dict:
     try:
         engine = local_engine() if use_local_engine() else None
     except Exception:
@@ -352,36 +359,86 @@ def csv_search_endpoint(req: CsvSearchRequest) -> dict:
                 for part in item.replace(";", ",").replace(" ", ",").split(",")
                 if part.strip()
             }
-    res = csv_engine().search(req.query, limit=req.limit, allowed_videos=allowed_videos)
+    res = engine_csv.search(req.query, limit=req.limit, allowed_videos=allowed_videos)
     matches = res.get("matches") or []
-    if matches:
-        for m in matches:
-            if not m.get("image_path") and engine is not None:
-                nbs = engine.video_neighbors(
-                    video_id=m["video_id"],
-                    timestamp=float(m.get("timestamp") or 0.0),
-                    window_seconds=10.0,
-                    limit=1,
-                )
-                if nbs:
-                    m["image_path"] = nbs[0]["image_path"]
-                    if m.get("frame_id") is None:
-                        m["frame_id"] = nbs[0]["frame_id"]
+    for match in matches:
+        if match.get("image_path"):
+            continue
+        match["keyframe_timestamp"] = None
+        if engine is None:
+            continue
+        start_ts = float(match.get("timestamp") or 0.0)
+        end_ts = match.get("end_timestamp")
+        midpoint = (start_ts + float(end_ts)) / 2.0 if end_ts is not None else start_ts
+        neighbors = engine.video_neighbors(
+            video_id=match["video_id"],
+            timestamp=midpoint,
+            window_seconds=15.0,
+            limit=5,
+        )
+        if neighbors:
+            closest = min(neighbors, key=lambda item: abs(float(item["timestamp"]) - midpoint))
+            match["image_path"] = closest["image_path"]
+            match["keyframe_timestamp"] = closest["timestamp"]
+            match["frame_id"] = closest["frame_id"]
     return res
+
+
+def _csv_upload(engine_csv: CsvSearchEngine, req: CsvUploadRequest, prefix: str) -> dict:
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", Path(req.filename).name)
+    if not safe_name.lower().endswith(".csv"):
+        safe_name += ".csv"
+    if not safe_name.lower().startswith(prefix):
+        safe_name = f"{prefix}_{safe_name}"
+    target = ARTIFACT / safe_name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="",
+            prefix=f".{safe_name}.",
+            suffix=".tmp",
+            dir=target.parent,
+            delete=False,
+        ) as handle:
+            handle.write(req.content)
+            handle.flush()
+            os.fsync(handle.fileno())
+            temp_path = Path(handle.name)
+        os.replace(temp_path, target)
+        temp_path = None
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+    engine_csv.reload_if_needed(force=True)
+    return {"ok": True, "saved_as": safe_name, **engine_csv.status()}
+
+
+@app.post("/api/csv/search")
+def csv_search_endpoint(req: CsvSearchRequest) -> dict:
+    return _csv_search(csv_engine(), req)
 
 
 @app.post("/api/csv/upload")
 def csv_upload_endpoint(req: CsvUploadRequest) -> dict:
-    import re
+    return _csv_upload(csv_engine(), req, "ocr")
 
-    safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", Path(req.filename).name)
-    if not safe_name.lower().endswith(".csv"):
-        safe_name += ".csv"
-    target = ARTIFACT / safe_name
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(req.content, encoding="utf-8")
-    csv_engine().reload_if_needed(force=True)
-    return {"ok": True, "saved_as": safe_name, **csv_engine().status()}
+
+@app.get("/api/asr/status")
+def asr_status_endpoint() -> dict:
+    return asr_engine().status()
+
+
+@app.post("/api/asr/search")
+def asr_search_endpoint(req: CsvSearchRequest) -> dict:
+    return _csv_search(asr_engine(), req)
+
+
+@app.post("/api/asr/upload")
+def asr_upload_endpoint(req: CsvUploadRequest) -> dict:
+    return _csv_upload(asr_engine(), req, "asr")
 
 
 @app.post("/api/feedback")

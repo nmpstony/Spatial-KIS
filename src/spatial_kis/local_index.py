@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import fnmatch
 import logging
 import pickle
 import re
@@ -512,6 +513,232 @@ def _ocr_segments_and_text(text_norm: str) -> tuple[str, tuple[tuple[str, ...], 
     return text_ocr, segments
 
 
+_ASR_TRANSLITERATIONS = str.maketrans(
+    {"œ": "oe", "æ": "ae", "Œ": "OE", "Æ": "AE"}
+)
+
+
+def _asr_aligned_segments(
+    text: str,
+) -> tuple[str, tuple[tuple[str, ...], ...], tuple[tuple[str, ...], ...]]:
+    """Tokenize ASR text into permanently aligned normalized/raw token pairs."""
+    text = unicodedata.normalize("NFC", text)
+    raw_pipe = "".join(
+        char.lower() if (char.isalnum() or char == "|") else " "
+        for char in text
+    )
+    norm_segments: list[tuple[str, ...]] = []
+    raw_segments: list[tuple[str, ...]] = []
+    for raw_segment in raw_pipe.split("|"):
+        norm_tokens: list[str] = []
+        kept_raw_tokens: list[str] = []
+        for raw_token in raw_segment.split():
+            normalized = strip_accents(raw_token.translate(_ASR_TRANSLITERATIONS))
+            normalized = _NON_ALNUM_RE.sub("", normalized)
+            if normalized:
+                norm_tokens.append(normalized)
+                kept_raw_tokens.append(raw_token)
+        if norm_tokens:
+            norm_segment = tuple(norm_tokens)
+            kept_raw_segment = tuple(kept_raw_tokens)
+            assert len(norm_segment) == len(kept_raw_segment)
+            norm_segments.append(norm_segment)
+            raw_segments.append(kept_raw_segment)
+    segments = tuple(norm_segments)
+    aligned_raw_segments = tuple(raw_segments)
+    assert len(segments) == len(aligned_raw_segments)
+    return " ".join(" ".join(seg) for seg in segments), segments, aligned_raw_segments
+
+
+def _has_diacritics(token: str) -> bool:
+    return token.lower() != strip_accents(token)
+
+
+def _asr_accent_conflicts(
+    query_raw_tokens: tuple[str, ...],
+    query_has_diacritics: tuple[bool, ...],
+    candidate_tokens: tuple[str, ...],
+    candidate_raw_tokens: tuple[str, ...],
+) -> int:
+    """Count differing explicit accents without normalizing inside the hot loop."""
+    return sum(
+        1
+        for query_raw, query_has, candidate, candidate_raw in zip(
+            query_raw_tokens,
+            query_has_diacritics,
+            candidate_tokens,
+            candidate_raw_tokens,
+        )
+        if query_has
+        and candidate_raw != candidate
+        and query_raw != candidate_raw
+    )
+
+
+def _asr_conflicts_allowed(query_tokens: tuple[str, ...]) -> int:
+    return 1 if len(query_tokens) >= 4 else 0
+
+
+def _asr_contiguous_accent_match(
+    q_words: tuple[str, ...],
+    q_raw_words: tuple[str, ...],
+    q_has_diacritics: tuple[bool, ...],
+    row_segments: tuple[tuple[str, ...], ...],
+    raw_segments: tuple[tuple[str, ...], ...],
+) -> bool:
+    """Find a normalized contiguous match with an acceptable accent pattern."""
+    if not q_words:
+        return False
+    allowed = _asr_conflicts_allowed(q_raw_words)
+    for segment, raw_segment in zip(row_segments, raw_segments):
+        width = len(q_words)
+        for start in range(len(segment) - width + 1):
+            normalized_match = (
+                q_words[0] in segment[start]
+                if width == 1
+                else segment[start : start + width] == q_words
+            )
+            if not normalized_match:
+                continue
+            candidate_window = segment[start : start + width]
+            raw_window = raw_segment[start : start + width]
+            if _asr_accent_conflicts(
+                q_raw_words, q_has_diacritics, candidate_window, raw_window
+            ) <= allowed:
+                return True
+    return False
+
+
+def _unit_edit_cost(a: str, b: str, max_edits: int = 1) -> float:
+    """Unweighted Levenshtein distance with a small bounded-distance fast path."""
+    if abs(len(a) - len(b)) > max_edits:
+        return float(max_edits + 1)
+    if a == b:
+        return 0.0
+    if len(a) > len(b):
+        a, b = b, a
+    previous = list(range(len(a) + 1))
+    for j, char_b in enumerate(b, 1):
+        current = [j]
+        row_min = j
+        for i, char_a in enumerate(a, 1):
+            value = min(
+                current[-1] + 1,
+                previous[i] + 1,
+                previous[i - 1] + (char_a != char_b),
+            )
+            current.append(value)
+            row_min = min(row_min, value)
+        if row_min > max_edits:
+            return float(max_edits + 1)
+        previous = current
+    return float(previous[-1])
+
+
+def _asr_tokens_in_order(
+    q_words: tuple[str, ...],
+    row_segments: tuple[tuple[str, ...], ...],
+    max_gap: int = 2,
+    q_raw_words: tuple[str, ...] | None = None,
+    q_has_diacritics: tuple[bool, ...] | None = None,
+    raw_segments: tuple[tuple[str, ...], ...] | None = None,
+) -> bool:
+    """Match tokens in one segment with at most ``max_gap`` filler tokens per step."""
+    if len(q_words) < 2:
+        return False
+    allowed_conflicts = _asr_conflicts_allowed(q_raw_words or ())
+    for segment_index, segment in enumerate(row_segments):
+        if len(segment) < len(q_words):
+            continue
+        for first_pos, token in enumerate(segment):
+            if token != q_words[0]:
+                continue
+            paths = [(first_pos,)]
+            for query_token in q_words[1:]:
+                next_paths: list[tuple[int, ...]] = []
+                for path in paths:
+                    previous = path[-1]
+                    stop = min(len(segment), previous + max_gap + 2)
+                    next_paths.extend(
+                        path + (pos,)
+                        for pos in range(previous + 1, stop)
+                        if segment[pos] == query_token
+                    )
+                paths = next_paths
+                if not paths:
+                    break
+            if not paths:
+                continue
+            for positions in paths:
+                if q_raw_words is not None and raw_segments is not None:
+                    raw_segment = raw_segments[segment_index]
+                    candidate = tuple(segment[pos] for pos in positions)
+                    candidate_raw = tuple(raw_segment[pos] for pos in positions)
+                    if _asr_accent_conflicts(
+                        q_raw_words,
+                        q_has_diacritics or (),
+                        candidate,
+                        candidate_raw,
+                    ) > allowed_conflicts:
+                        continue
+                return True
+    return False
+
+
+def _asr_fuzzy_phrase_match(
+    q_words: tuple[str, ...],
+    q_compact: str,
+    row_segments: tuple[tuple[str, ...], ...],
+    segment_lens: tuple[tuple[int, ...], ...],
+    q_raw_words: tuple[str, ...] | None = None,
+    q_has_diacritics: tuple[bool, ...] | None = None,
+    raw_segments: tuple[tuple[str, ...], ...] | None = None,
+) -> float:
+    """Conservative one-edit ASR matching; short and numeric queries stay exact."""
+    min_length = 7 if len(q_words) >= 2 else 5
+    if len(q_compact) < min_length or any(char.isdigit() for char in q_compact):
+        return 0.0
+    word_count = len(q_words)
+    window_sizes = (1, 2) if word_count == 1 else tuple(
+        size for size in (word_count, word_count - 1, word_count + 1) if size >= 1
+    )
+    best = 0.0
+    allowed_conflicts = _asr_conflicts_allowed(q_raw_words or ())
+    query_length = len(q_compact)
+    for segment_index, segment in enumerate(row_segments):
+        token_lens = segment_lens[segment_index]
+        for window_size in window_sizes:
+            if len(segment) < window_size:
+                continue
+            for start in range(len(segment) - window_size + 1):
+                stop = start + window_size
+                candidate_length = sum(token_lens[start:stop])
+                if abs(candidate_length - query_length) > 1:
+                    continue
+                # A one-edit match must agree at one edge (except for a
+                # one-character insertion/deletion). This avoids most DP calls.
+                if candidate_length == query_length and (
+                    segment[start][0] != q_compact[0]
+                    and segment[stop - 1][-1] != q_compact[-1]
+                ):
+                    continue
+                if q_raw_words is not None and raw_segments is not None:
+                    candidate_window = segment[start:stop]
+                    raw_window = raw_segments[segment_index][start:stop]
+                    if _asr_accent_conflicts(
+                        q_raw_words,
+                        q_has_diacritics or (),
+                        candidate_window,
+                        raw_window,
+                    ) > allowed_conflicts:
+                        continue
+                candidate = "".join(segment[start:stop])
+                cost = _unit_edit_cost(q_compact, candidate, max_edits=1)
+                if cost <= 1.0:
+                    best = max(best, 1.0 - cost / len(q_compact))
+    return best
+
+
 def _ocr_weighted_cost(a: str, b: str, max_cost: float, max_unit_edits: int = 1) -> float:
     """Confusion-weighted Levenshtein cost with early exit and unit-edit cap."""
     la, lb = len(a), len(b)
@@ -639,13 +866,21 @@ def _fuzzy_phrase_match(
 class CsvSearchEngine:
     """In-memory index over OCR / ASR / Metadata CSV files in the artifact directory."""
 
-    def __init__(self, artifact_root: Path) -> None:
+    def __init__(
+        self,
+        artifact_root: Path,
+        source: str = "ocr",
+        patterns: tuple[str, ...] | None = None,
+    ) -> None:
         self.artifact_root = Path(artifact_root)
+        self.source = source
+        self.patterns = patterns if patterns is not None else (("asr*.csv",) if source == "asr" else ("ocr*.csv",))
         self._mtimes: dict[str, float] = {}
         self.rows: list[dict] = []
         self.files_info: list[dict] = []
         self.rows_by_video: dict[str, list[int]] = {}
         self.vocab_postings: dict[str, list[int]] = {}
+        self.asr_token_postings: dict[str, list[int]] = {}
         self.vocab_trigrams: dict[str, list[str]] = {}
         self.vocab_sig_trigrams: dict[str, list[str]] = {}
         self.vocab_by_len: dict[int, list[str]] = {}
@@ -656,12 +891,15 @@ class CsvSearchEngine:
 
     def _discover_csv_files(self) -> list[Path]:
         files: list[Path] = []
-        if self.artifact_root.is_dir():
-            files.extend(sorted(self.artifact_root.glob("*.csv")))
-            csv_sub = self.artifact_root / "csv"
-            if csv_sub.is_dir():
-                files.extend(sorted(csv_sub.glob("*.csv")))
-        return files
+        patterns = tuple(pattern.lower() for pattern in self.patterns)
+        for directory in (self.artifact_root, self.artifact_root / "csv"):
+            if directory.is_dir():
+                files.extend(
+                    path
+                    for path in directory.iterdir()
+                    if path.is_file() and any(fnmatch.fnmatchcase(path.name.lower(), pattern) for pattern in patterns)
+                )
+        return sorted(files, key=lambda path: (str(path.parent).lower(), path.name.lower()))
 
     def reload_if_needed(self, force: bool = False) -> None:
         import csv
@@ -676,6 +914,7 @@ class CsvSearchEngine:
         info_list: list[dict] = []
         rows_by_video: dict[str, list[int]] = defaultdict(list)
         vocab_postings: dict[str, list[int]] = defaultdict(list)
+        asr_token_postings: dict[str, list[int]] = defaultdict(list)
         row_sig_trigrams: dict[str, list[int]] = defaultdict(list)
 
         def _add_posting(key: str, ridx: int) -> None:
@@ -698,6 +937,9 @@ class CsvSearchEngine:
                     vid_col = -1
                     frame_col = -1
                     ts_col = -1
+                    end_col = -1
+                    ts_is_ms = False
+                    end_is_ms = False
                     text_cols: list[int] = []
                     skip_cols: set[int] = set()
                     for row_idx, row in enumerate(reader):
@@ -711,8 +953,12 @@ class CsvSearchEngine:
                                         vid_col = ci
                                     elif h in ("frame_id", "frame", "frame_idx") and frame_col < 0:
                                         frame_col = ci
-                                    elif h in ("timestamp", "time", "pts_time", "seconds", "timestamp_ms") and ts_col < 0:
+                                    elif h in ("start", "timestamp", "time", "pts_time", "seconds", "timestamp_ms") and ts_col < 0:
                                         ts_col = ci
+                                        ts_is_ms = h.endswith("_ms")
+                                    elif h in ("end", "end_timestamp", "end_time", "end_ms") and end_col < 0:
+                                        end_col = ci
+                                        end_is_ms = h.endswith("_ms")
                                     elif h in ("text", "ocr", "ocr_text", "transcript", "content"):
                                         text_cols.append(ci)
                                     elif h in ("conf", "confidence", "score", "bbox", "box"):
@@ -742,6 +988,17 @@ class CsvSearchEngine:
                         if 0 <= ts_col < len(row):
                             try:
                                 timestamp = float(row[ts_col].strip())
+                                if ts_is_ms:
+                                    timestamp /= 1000.0
+                            except Exception:
+                                pass
+
+                        end_timestamp = None
+                        if 0 <= end_col < len(row):
+                            try:
+                                end_timestamp = float(row[end_col].strip())
+                                if end_is_ms:
+                                    end_timestamp /= 1000.0
                             except Exception:
                                 pass
 
@@ -755,13 +1012,17 @@ class CsvSearchEngine:
                             text_parts = [
                                 c.strip()
                                 for ci, c in enumerate(row)
-                                if ci not in (vid_col, frame_col, ts_col) and ci not in skip_cols and c.strip() and c.strip().upper() != video_stem
+                                if ci not in (vid_col, frame_col, ts_col, end_col) and ci not in skip_cols and c.strip() and c.strip().upper() != video_stem
                             ]
                         text_joined = " | ".join(text_parts)
                         if not text_joined:
                             continue
                         text_norm = strip_accents(text_joined)
-                        text_ocr, row_segments = _ocr_segments_and_text(text_norm)
+                        if self.source == "asr":
+                            text_ocr, row_segments, raw_segments = _asr_aligned_segments(text_joined)
+                        else:
+                            text_ocr, row_segments = _ocr_segments_and_text(text_norm)
+                            raw_segments = ()
                         ridx = len(loaded_rows)
                         sig_segs_list: list[tuple[str, int, int]] = []
                         row_sig_seen: set[str] = set()
@@ -779,13 +1040,18 @@ class CsvSearchEngine:
                                         row_sig_trigrams[stg].append(ridx)
                             nt = len(seg_toks)
                             for si, tok in enumerate(seg_toks):
+                                if self.source == "asr":
+                                    token_postings = asr_token_postings[tok]
+                                    if not token_postings or token_postings[-1] != ridx:
+                                        token_postings.append(ridx)
                                 if len(tok) >= 2:
                                     _add_posting(tok, ridx)
                                 if si + 1 < nt:
                                     w2 = tok + seg_toks[si + 1]
                                     if 3 <= len(w2) <= 24:
                                         _add_posting(w2, ridx)
-                                    # Index 3+ token spans up to length 6 so 5-char multi-word queries retain full recall
+                                    # Keep 3+ token postings short; longer fuzzy phrases use the
+                                    # row signature index below instead of expanding every span.
                                     if len(w2) <= 6:
                                         acc = w2
                                         sj = si + 2
@@ -798,12 +1064,18 @@ class CsvSearchEngine:
                             "video_stem": video_stem,
                             "frame_id": frame_id,
                             "timestamp": timestamp,
+                            "end_timestamp": end_timestamp,
                             "text": text_joined,
                             "text_low": text_joined.lower(),
                             "text_norm": text_norm,
                             "text_ocr": text_ocr,
                             "text_compact": text_ocr.replace(" ", ""),
                             "segments": row_segments,
+                            "segment_lens": tuple(
+                                tuple(len(token) for token in segment)
+                                for segment in row_segments
+                            ),
+                            "raw_segments": raw_segments,
                             "sig_segs": tuple(sig_segs_list),
                             "file": path.name,
                         })
@@ -830,6 +1102,7 @@ class CsvSearchEngine:
         self.files_info = info_list
         self.rows_by_video = dict(rows_by_video)
         self.vocab_postings = dict(vocab_postings)
+        self.asr_token_postings = dict(asr_token_postings)
         self.vocab_trigrams = dict(vocab_trigrams)
         self.vocab_sig_trigrams = dict(vocab_sig_trigrams)
         self.vocab_by_len = dict(vocab_by_len)
@@ -842,6 +1115,7 @@ class CsvSearchEngine:
         self.reload_if_needed()
         unique_vids = len({r["video_stem"] for r in self.rows})
         return {
+            "source": self.source,
             "total_rows": len(self.rows),
             "unique_videos": unique_vids,
             "files": self.files_info,
@@ -866,9 +1140,19 @@ class CsvSearchEngine:
 
         cand_set: set[int] = set()
         vocab_masks = self.vocab_masks
-        for q_low, q_norm, q_ocr, q_words, q_compact, q_tri, is_num in terms:
+        for q_low, q_norm, q_ocr, q_words, q_compact, q_tri, is_num, q_raw_words, q_has_diacritics in terms:
             # 1) Exact / substring matches via trigram-indexed or direct vocab keys
-            if q_compact:
+            if self.source == "asr" and len(q_words) >= 2:
+                posting_lists = [self.asr_token_postings.get(word, ()) for word in q_words]
+                if all(posting_lists):
+                    posting_lists.sort(key=len)
+                    exact_rows = set(posting_lists[0])
+                    for postings in posting_lists[1:]:
+                        exact_rows.intersection_update(postings)
+                        if not exact_rows:
+                            break
+                    cand_set.update(exact_rows)
+            elif q_compact:
                 if q_compact in self.vocab_postings:
                     cand_set.update(self.vocab_postings[q_compact])
                 if len(q_compact) >= 3:
@@ -879,13 +1163,72 @@ class CsvSearchEngine:
                     for vk, plist in self.vocab_postings.items():
                         if q_compact in vk:
                             cand_set.update(plist)
-            if len(q_words) > 1:
+            if self.source != "asr" and len(q_words) > 1:
                 for qw in q_words:
                     if len(qw) >= 3 and qw in self.vocab_postings:
                         cand_set.update(self.vocab_postings[qw])
 
             # 2) Confusion-weighted fuzzy vocabulary expansion via canonical signature trigrams + cache
-            if fuzzy and not is_num and len(q_compact) >= 4:
+            asr_fuzzy_min = 7 if len(q_words) >= 2 else 5
+            if fuzzy and self.source == "asr" and not is_num and len(q_compact) >= asr_fuzzy_min:
+                q_len = len(q_compact)
+                q_mask = _conf_mask(q_compact)
+                q_sig = _conf_sig(q_compact)
+                cache_key = f"asr:{q_compact}"
+                matched_vks = self._fuzzy_vocab_cache.get(cache_key)
+                if matched_vks is None:
+                    vocab_pool: set[str] = set()
+                    if q_len >= 6:
+                        for stg in _make_trigrams(q_sig):
+                            for vk in self.vocab_sig_trigrams.get(stg, ()):
+                                if abs(len(vk) - q_len) <= 1:
+                                    vocab_pool.add(vk)
+                    else:  # A one-edit 5-character match may share no full trigram.
+                        q_sig_bgs = tuple({q_sig[i : i + 2] for i in range(len(q_sig) - 1)})
+                        for cand_len in range(q_len - 1, q_len + 2):
+                            for vk in self.vocab_by_len.get(cand_len, ()):
+                                vk_sig = _conf_sig(vk)
+                                if any(bg in vk_sig for bg in q_sig_bgs):
+                                    vocab_pool.add(vk)
+                    matched_vks = tuple(
+                        vk
+                        for vk in vocab_pool
+                        if _unit_edit_cost(q_compact, vk, max_edits=1) <= 1.0
+                    )
+                    if len(self._fuzzy_vocab_cache) >= 512:
+                        self._fuzzy_vocab_cache.clear()
+                    self._fuzzy_vocab_cache[cache_key] = matched_vks
+                for vk in matched_vks:
+                    cand_set.update(self.vocab_postings[vk])
+
+                # 3) Multi-token ASR recall: one edit guarantees that at least
+                # one half of the canonical query signature remains intact.
+                if len(q_words) >= 2 and q_len >= 12:
+                    parts = (q_sig[: q_len // 2], q_sig[q_len // 2 :])
+                    row_sig_tris = self.row_sig_trigrams
+                    for sub in parts:
+                        tris = sorted(_make_trigrams(sub), key=lambda tg: len(row_sig_tris.get(tg, ())))
+                        if not tris:
+                            continue
+                        sub_rows = set(row_sig_tris.get(tris[0], ()))
+                        for tg in tris[1:]:
+                            if not sub_rows:
+                                break
+                            sub_rows.intersection_update(row_sig_tris.get(tg, ()))
+                        if allowed_row_set is not None:
+                            sub_rows.intersection_update(allowed_row_set)
+                        for idx in sub_rows:
+                            if idx in cand_set:
+                                continue
+                            for sp, sm, slen in self.rows[idx]["sig_segs"]:
+                                if slen >= q_len - 1 and sub in sp:
+                                    missing = q_mask & ~sm
+                                    if (missing & (missing - 1)) == 0:
+                                        cand_set.add(idx)
+                                        break
+
+            # OCR confusion-weighted fuzzy vocabulary expansion.
+            elif fuzzy and self.source != "asr" and not is_num and len(q_compact) >= 4:
                 q_len = len(q_compact)
                 max_cost, max_unit = _fuzzy_budget(q_len)
                 q_mask = _conf_mask(q_compact)
@@ -963,7 +1306,7 @@ class CsvSearchEngine:
         self.reload_if_needed()
         q_raw = query.strip()
         if not q_raw:
-            return {"query": "", "video_ids": [], "matches": [], "total_rows": len(self.rows), "files": self.files_info}
+            return {"source": self.source, "query": "", "video_ids": [], "matches": [], "total_rows": len(self.rows), "files": self.files_info}
 
         # Split by comma or semicolon into multiple keywords
         terms_raw = [t.strip() for t in q_raw.replace(";", ",").split(",") if t.strip()]
@@ -971,11 +1314,34 @@ class CsvSearchEngine:
         for t in terms_raw:
             t_low = t.lower()
             t_norm = strip_accents(t)
-            t_ocr = ocr_canonical(t)
-            q_words = tuple(t_ocr.split())
+            if self.source == "asr":
+                t_ocr, query_segments, raw_query_segments = _asr_aligned_segments(t)
+                q_words = tuple(token for segment in query_segments for token in segment)
+            else:
+                t_ocr = ocr_canonical(t)
+                q_words = tuple(t_ocr.split())
+                raw_query_segments = ()
             q_compact = "".join(q_words)
-            is_num = t_norm.replace(" ", "").isdigit()
-            terms.append((t_low, t_norm, t_ocr, q_words, q_compact, _make_trigrams(q_compact), is_num))
+            is_num = (
+                any(char.isdigit() for char in t_norm)
+                if self.source == "asr"
+                else t_norm.replace(" ", "").isdigit()
+            )
+            q_raw_words = tuple(token for segment in raw_query_segments for token in segment)
+            q_has_diacritics = tuple(_has_diacritics(word) for word in q_raw_words)
+            terms.append(
+                (
+                    t_low,
+                    t_norm,
+                    t_ocr,
+                    q_words,
+                    q_compact,
+                    _make_trigrams(q_compact),
+                    is_num,
+                    q_raw_words,
+                    q_has_diacritics,
+                )
+            )
 
         video_term_hits: dict[str, set[int]] = defaultdict(set)
         video_best_tier: dict[str, int] = defaultdict(int)
@@ -998,25 +1364,74 @@ class CsvSearchEngine:
             t_ocr = r["text_ocr"]
             t_compact = r["text_compact"]
             t_segments = r["segments"]
+            segment_lens = r["segment_lens"]
+            raw_segments = r["raw_segments"]
 
             hit_idxs: list[int] = []
             row_best_tier = 0
             row_score = 0.0
-            for ti, (q_low, q_norm, q_ocr, q_words, q_compact, q_tri, is_num) in enumerate(terms):
-                # Tier 4 / 3: Exact boundary or exact normalized substring
-                exact_hit = (q_low in t_low) or bool(q_norm and q_norm in t_norm)
-                if exact_hit:
+            for ti, (
+                q_low,
+                q_norm,
+                q_ocr,
+                q_words,
+                q_compact,
+                q_tri,
+                is_num,
+                q_raw_words,
+                q_has_diacritics,
+            ) in enumerate(terms):
+                if self.source == "asr" and q_low in t_low:
+                    # Preserve accents as the strongest evidence. A raw word-boundary
+                    # phrase outranks a mere accented substring.
+                    is_boundary = bool(
+                        re.search(rf"(?<!\w){re.escape(q_low)}(?!\w)", t_low)
+                    )
+                    tier = 5 if is_boundary else 4
+                    hit_idxs.append(ti)
+                    row_best_tier = max(row_best_tier, tier)
+                    row_score += float(tier)
+                elif self.source == "asr" and _asr_contiguous_accent_match(
+                    q_words, q_raw_words, q_has_diacritics, t_segments, raw_segments
+                ):
+                    hit_idxs.append(ti)
+                    row_best_tier = max(row_best_tier, 3)
+                    row_score += 3.0
+                elif self.source != "asr" and ((q_low in t_low) or bool(q_norm and q_norm in t_norm)):
+                    # Keep the established OCR ranking behavior unchanged.
                     hit_idxs.append(ti)
                     is_boundary = bool(q_ocr and f" {q_ocr} " in f" {t_norm} ")
                     tier = 4 if is_boundary else 3
                     row_best_tier = max(row_best_tier, tier)
                     row_score += float(tier)
-                elif not is_num and q_ocr and q_ocr in t_ocr:
+                elif not is_num and q_ocr and q_ocr in t_ocr and self.source != "asr":
                     hit_idxs.append(ti)
                     row_best_tier = max(row_best_tier, 2)
                     row_score += 2.0
+                elif self.source == "asr" and len(q_words) >= 2 and _asr_tokens_in_order(
+                    q_words,
+                    t_segments,
+                    q_raw_words=q_raw_words,
+                    q_has_diacritics=q_has_diacritics,
+                    raw_segments=raw_segments,
+                ):
+                    hit_idxs.append(ti)
+                    row_best_tier = max(row_best_tier, 2)
+                    row_score += 1.8
                 elif fuzzy and not is_num:
-                    f_score = _fuzzy_phrase_match(q_words, q_compact, q_tri, t_segments, t_compact)
+                    f_score = (
+                        _asr_fuzzy_phrase_match(
+                            q_words,
+                            q_compact,
+                            t_segments,
+                            segment_lens,
+                            q_raw_words=q_raw_words,
+                            q_has_diacritics=q_has_diacritics,
+                            raw_segments=raw_segments,
+                        )
+                        if self.source == "asr"
+                        else _fuzzy_phrase_match(q_words, q_compact, q_tri, t_segments, t_compact)
+                    )
                     if f_score > 0.0:
                         hit_idxs.append(ti)
                         row_best_tier = max(row_best_tier, 1)
@@ -1030,12 +1445,16 @@ class CsvSearchEngine:
                 if len(matched_snippets) < raw_cap or row_best_tier >= 2:
                     frame_id = r["frame_id"]
                     ts_val = r["timestamp"]
+                    end_ts_val = r["end_timestamp"]
                     match_type = "exact" if row_best_tier >= 3 else ("ocr" if row_best_tier == 2 else "fuzzy")
                     matched_snippets.append({
+                        "source": self.source,
                         "video_id": stem,
                         "frame_id": frame_id,
                         "timestamp": ts_val,
-                        "timestamp_ms": round(ts_val * 1000) if ts_val is not None else 0,
+                        "end_timestamp": end_ts_val,
+                        "timestamp_ms": round(ts_val * 1000) if ts_val is not None else None,
+                        "end_ms": round(end_ts_val * 1000) if end_ts_val is not None else None,
                         "image_path": f"images/{stem}/frame_{frame_id}.webp" if frame_id is not None else None,
                         "text": r["text"][:220],
                         "file": r["file"],
@@ -1062,6 +1481,7 @@ class CsvSearchEngine:
         filtered_snippets = filtered_snippets[:limit]
 
         return {
+            "source": self.source,
             "query": q_raw,
             "video_ids": target_videos,
             "video_count": len(target_videos),
