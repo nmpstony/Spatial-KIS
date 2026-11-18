@@ -449,6 +449,15 @@ def feedback(request: Feedback) -> dict:
     return {"ok": True}
 
 
+def _normalize_dres_url(url: str) -> str:
+    url = (url or "").strip().rstrip("/")
+    if not url:
+        return "https://eventretrieval.one"
+    if not url.startswith(("http://", "https://")):
+        url = f"https://{url}"
+    return url
+
+
 def _dres_json_request(url: str, method: str = "GET", payload: dict | None = None) -> dict | list:
     headers = {"Accept": "application/json"}
     data = None
@@ -469,7 +478,7 @@ def _dres_json_request(url: str, method: str = "GET", payload: dict | None = Non
 
 @app.post("/api/dres/login")
 def dres_login(req: DresLoginRequest) -> dict:
-    base = req.base_url.rstrip("/")
+    base = _normalize_dres_url(req.base_url)
     login_data = _dres_json_request(
         f"{base}/api/v2/login",
         method="POST",
@@ -493,7 +502,7 @@ def dres_login(req: DresLoginRequest) -> dict:
 
 @app.get("/api/dres/evaluations")
 def dres_evaluations(base_url: str = Query("https://eventretrieval.one"), session_id: str = Query(...)) -> dict:
-    base = base_url.rstrip("/")
+    base = _normalize_dres_url(base_url)
     eval_res = _dres_json_request(
         f"{base}/api/v2/client/evaluation/list?session={urllib.parse.quote(session_id)}",
         method="GET",
@@ -503,7 +512,7 @@ def dres_evaluations(base_url: str = Query("https://eventretrieval.one"), sessio
 
 @app.post("/api/dres/submit")
 def dres_submit(req: DresSubmitRequest) -> dict:
-    base = req.base_url.rstrip("/")
+    base = _normalize_dres_url(req.base_url)
     video_stem = clean_video_name(req.video_id)
     start_ms = int(req.start_ms)
     end_ms = int(req.end_ms if req.end_ms is not None else start_ms)
