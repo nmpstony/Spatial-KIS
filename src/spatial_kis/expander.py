@@ -13,6 +13,7 @@ from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
 DEFAULT_MODEL = "vinai/vinai-translate-vi2en-v2"
 FALLBACK_MODEL = "Helsinki-NLP/opus-mt-vi-en"
+CPU_DEFAULT_MODEL = FALLBACK_MODEL
 logger = logging.getLogger(__name__)
 
 
@@ -54,8 +55,10 @@ def clean_vi_prompt(text: str) -> tuple[str, bool]:
 
 class LocalExpander:
     def __init__(self, model_name: str | None = None) -> None:
-        self.model_name = model_name or os.getenv("SPATIAL_KIS_TRANSLATION_MODEL", DEFAULT_MODEL)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        configured_model = os.getenv("SPATIAL_KIS_TRANSLATION_MODEL", "").strip()
+        device_default = DEFAULT_MODEL if self.device.type == "cuda" else CPU_DEFAULT_MODEL
+        self.model_name = model_name or configured_model or device_default
         self._lock = threading.Lock()
         try:
             self.tokenizer, self.model = self._load(self.model_name)
@@ -111,8 +114,8 @@ class LocalExpander:
                     logger.debug("Could not clear translator generation_config.max_length", exc_info=True)
                 if (
                     self.device.type != "cuda"
-                    and os.getenv("SPATIAL_KIS_QUANTIZE_TRANSLATOR", "1").strip().lower()
-                    not in ("0", "false", "no")
+                    and os.getenv("SPATIAL_KIS_QUANTIZE_TRANSLATOR", "0").strip().lower()
+                    in ("1", "true", "yes")
                     and isinstance(model, torch.nn.Module)
                     and hasattr(torch, "ao")
                     and hasattr(torch.ao, "quantization")
@@ -156,12 +159,14 @@ class LocalExpander:
         cleaned, has_cano = clean_vi_prompt(text)
         with self._lock:
             tokens = self.tokenizer([cleaned], return_tensors="pt", truncation=True).to(self.device)
+            num_beams = 3 if self.device.type == "cuda" else 1
             generate_kwargs = {
                 "max_new_tokens": 64,
-                "num_beams": 3 if self.device.type == "cuda" else 1,
-                "early_stopping": True,
+                "num_beams": num_beams,
                 "do_sample": False,
             }
+            if num_beams > 1:
+                generate_kwargs["early_stopping"] = True
             decoder_start_token_id = self._decoder_start_token_id()
             if decoder_start_token_id is not None:
                 generate_kwargs["decoder_start_token_id"] = decoder_start_token_id
