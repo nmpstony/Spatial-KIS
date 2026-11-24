@@ -30,6 +30,9 @@ let currentInspectItem = null;
 let segmentPlayback = false;
 let lastVisualResults = [];
 let lastVisualLatencyMs = 0;
+let baselineVisualResults = null;
+let baselineVisualLatencyMs = 0;
+let baselineVisualScope = null;
 let activeCombinedFilter = null;
 let combineMode = localStorage.getItem('spatialKis.filterCombineMode') === 'or' ? 'or' : 'and';
 let gridDensity = localStorage.getItem('spatialKis.gridDensity') === 'compact' ? 'compact' : 'comfortable';
@@ -75,8 +78,14 @@ function getVisualCandidateVideos() {
   return [...new Set(lastVisualResults.map((item) => (item.video_stem || cleanVideoStem(item.video_id)).toUpperCase()).filter(Boolean))];
 }
 
-function visualSignature() {
-  return getVisualCandidateVideos().slice().sort().join(',');
+function getScopeFilterTokens() {
+  if (!$('#use-video-filter')?.checked) return [];
+  return ($('#video-filter-input')?.value || '').split(/[\s,;]+/).map((value) => value.trim()).filter(Boolean);
+}
+
+function scopeSignature() {
+  const enabled = Boolean($('#use-video-filter')?.checked);
+  return `${enabled ? 'on' : 'off'}:${getScopeFilterTokens().map((value) => value.toUpperCase()).sort().join(',')}`;
 }
 
 function cacheKey(signature, query) {
@@ -529,9 +538,7 @@ function combineSets(baseVideos, ocrResult, asrResult, mode) {
   return base.size ? new Set([...combined].filter((id) => base.has(id))) : combined;
 }
 
-function commitCombined(signature, ocrResult, asrResult, direct = false) {
-  const videos = getVisualCandidateVideos();
-  const videoSet = combineSets(videos, ocrResult, asrResult, combineMode);
+function commitCombined(signature, ocrResult, asrResult, videoSet, direct = false) {
   activeCombinedFilter = { signature, mode: combineMode, direct, ocr: ocrResult, asr: asrResult, videoSet };
   evidenceShowAll = false;
   renderEvidence();
@@ -539,18 +546,79 @@ function commitCombined(signature, ocrResult, asrResult, direct = false) {
   updateFilterSummary();
 }
 
-function recombineFromCache() {
-  const signature = visualSignature();
+async function applyTextFilterToVisual(signature, ocrResult, asrResult, generation, visualGen) {
+  if (generation !== filterGeneration || visualGen !== visualGeneration || scopeSignature() !== signature) return;
+  const combinedVideoSet = combineSets([], ocrResult, asrResult, combineMode);
+  const conditions = getConditions();
+  if (!conditions.length) {
+    lastVisualResults = [];
+    lastVisualLatencyMs = 0;
+    commitCombined(signature, ocrResult, asrResult, combinedVideoSet, true);
+    statusEl.textContent = `${combinedVideoSet.size} videos matched OCR/ASR · direct corpus evidence`;
+    return;
+  }
+
+  if (!combinedVideoSet.size) {
+    lastVisualResults = [];
+    lastVisualLatencyMs = 0;
+    commitCombined(signature, ocrResult, asrResult, combinedVideoSet, false);
+    candidateBadge.textContent = '0 visual results · 0 videos matched OCR/ASR filter';
+    candidateBadge.dataset.state = 'ok';
+    statusEl.textContent = '0 visual results · 0 videos matched OCR/ASR filter';
+    return;
+  }
+
+  visualSearchController?.abort();
+  visualSearchController = new AbortController();
+  const request = {
+    conditions,
+    result_limit: 120,
+    diversify: Boolean($('#diversify')?.checked),
+    expand: Boolean($('#expand')?.checked),
+    max_temporal_gap: Number($('#temporal-gap')?.value) || 45,
+    video_filter: [...combinedVideoSet],
+  };
+  candidateBadge.textContent = `${combinedVideoSet.size} OCR/ASR videos matched · re-ranking visual scenes…`;
+  statusEl.textContent = `Searching visual scenes inside ${combinedVideoSet.size} OCR/ASR videos…`;
+  const started = performance.now();
+  try {
+    const response = await fetch('/api/search', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(request), signal: visualSearchController.signal });
+    const data = await response.json().catch(() => ({}));
+    if (generation !== filterGeneration || visualGen !== visualGeneration || scopeSignature() !== signature) return;
+    if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`);
+    lastVisualResults = data.results || [];
+    lastVisualLatencyMs = Math.round(performance.now() - started);
+    commitCombined(signature, ocrResult, asrResult, combinedVideoSet, false);
+    const visualVideos = getVisualCandidateVideos().length;
+    candidateBadge.textContent = `${combinedVideoSet.size} videos matched OCR/ASR · ${lastVisualResults.length} visual results in ${visualVideos} videos`;
+    candidateBadge.dataset.state = 'ok';
+    statusEl.textContent = `${lastVisualResults.length} visual results inside ${combinedVideoSet.size} OCR/ASR-matched videos · ${lastVisualLatencyMs} ms`;
+  } catch (error) {
+    if (error.name !== 'AbortError' && generation === filterGeneration && visualGen === visualGeneration) {
+      candidateBadge.textContent = `Visual re-rank failed · ${error.message}`;
+      candidateBadge.dataset.state = 'error';
+      statusEl.textContent = `Visual re-rank failed: ${error.message}`;
+    }
+  }
+}
+
+async function recombineFromCache() {
+  const signature = scopeSignature();
   const ocrQuery = csvQueryInput?.value.trim() || '';
   const asrQuery = asrQueryInput?.value.trim() || '';
   const ocrResult = ocrQuery ? modalityCaches.ocr.get(cacheKey(signature, ocrQuery)) : null;
   const asrResult = asrQuery ? modalityCaches.asr.get(cacheKey(signature, asrQuery)) : null;
-  if ((!ocrQuery || ocrResult) && (!asrQuery || asrResult) && (ocrQuery || asrQuery)) commitCombined(signature, ocrResult, asrResult, !signature);
+  if ((!ocrQuery || ocrResult) && (!asrQuery || asrResult) && (ocrQuery || asrQuery)) {
+    const generation = ++filterGeneration;
+    const visualGen = ++visualGeneration;
+    visualSearchController?.abort();
+    await applyTextFilterToVisual(signature, ocrResult, asrResult, generation, visualGen);
+  }
   else updateFilterSummary();
 }
 
 async function fetchModality(source, query, videos, signal) {
-  const response = await fetch(source === 'ocr' ? '/api/csv/search' : '/api/asr/search', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ query, limit: 160, video_filter: videos.length ? videos : null }), signal });
+  const response = await fetch(source === 'ocr' ? '/api/csv/search' : '/api/asr/search', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ query, limit: 200, video_filter: videos.length ? videos : null }), signal });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(data.detail || data.error || `HTTP ${response.status}`);
   return normalizeModalityResult(data, source);
@@ -560,16 +628,24 @@ async function runCombinedFilter() {
   const ocrQuery = csvQueryInput?.value.trim() || '';
   const asrQuery = asrQueryInput?.value.trim() || '';
   if (!ocrQuery && !asrQuery) { resetCombinedFilter(); return; }
-  const videos = getVisualCandidateVideos();
-  const signature = videos.slice().sort().join(',');
+  const scopeVideos = getScopeFilterTokens();
+  const signature = scopeSignature();
   const generation = ++filterGeneration;
+  const visualGen = ++visualGeneration;
+  visualSearchController?.abort();
   ocrAbortController?.abort();
   asrAbortController?.abort();
   ocrAbortController = new AbortController();
   asrAbortController = new AbortController();
   const applyButton = $('#filter-apply-btn');
   if (applyButton) { applyButton.disabled = true; applyButton.textContent = 'Filtering…'; }
-  candidateBadge.textContent = videos.length ? `Searching ${videos.length} visual candidate videos…` : 'Searching the full OCR / ASR corpus…';
+  candidateBadge.textContent = scopeVideos.length ? `Searching OCR / ASR within ${scopeVideos.length} scope tokens…` : 'Searching the full OCR / ASR corpus…';
+
+  await expandPendingConditions(visualGen);
+  if (generation !== filterGeneration || visualGen !== visualGeneration || scopeSignature() !== signature) {
+    if (generation === filterGeneration && applyButton) { applyButton.disabled = false; applyButton.textContent = 'Apply filters'; }
+    return;
+  }
 
   const tasks = [];
   const labels = [];
@@ -578,10 +654,13 @@ async function runCombinedFilter() {
     labels.push(source);
     const key = cacheKey(signature, query);
     const cached = modalityCaches[source].get(key);
-    tasks.push(cached ? Promise.resolve(cached) : fetchModality(source, query, videos, controller.signal).then((result) => { cacheSet(source, key, result); return result; }));
+    tasks.push(cached ? Promise.resolve(cached) : fetchModality(source, query, scopeVideos, controller.signal).then((result) => { cacheSet(source, key, result); return result; }));
   }
   const settled = await Promise.allSettled(tasks);
-  if (generation !== filterGeneration || visualSignature() !== signature) return;
+  if (generation !== filterGeneration || visualGen !== visualGeneration || scopeSignature() !== signature) {
+    if (generation === filterGeneration && applyButton) { applyButton.disabled = false; applyButton.textContent = 'Apply filters'; }
+    return;
+  }
   const failed = settled.map((result, index) => result.status === 'rejected' && result.reason?.name !== 'AbortError' ? `${labels[index].toUpperCase()}: ${result.reason?.message || 'request failed'}` : null).filter(Boolean);
   if (failed.length) {
     candidateBadge.textContent = `Filter not changed · ${failed.join(' · ')}`;
@@ -591,15 +670,17 @@ async function runCombinedFilter() {
     let ocrResult = null;
     let asrResult = null;
     settled.forEach((result, index) => { if (labels[index] === 'ocr') ocrResult = result.value; else asrResult = result.value; });
-    commitCombined(signature, ocrResult, asrResult, !videos.length);
+    await applyTextFilterToVisual(signature, ocrResult, asrResult, generation, visualGen);
   }
   if (applyButton) { applyButton.disabled = false; applyButton.textContent = 'Apply filters'; }
 }
 
 function resetCombinedFilter() {
   ++filterGeneration;
+  ++visualGeneration;
   ocrAbortController?.abort();
   asrAbortController?.abort();
+  visualSearchController?.abort();
   activeCombinedFilter = null;
   const applyButton = $('#filter-apply-btn');
   if (applyButton) { applyButton.disabled = false; applyButton.textContent = 'Apply filters'; }
@@ -607,7 +688,15 @@ function resetCombinedFilter() {
   if (asrQueryInput) asrQueryInput.value = '';
   if (csvResultsBar) { csvResultsBar.hidden = true; csvResultsBar.replaceChildren(); }
   if (evidenceSection) { evidenceSection.hidden = true; evidenceSection.replaceChildren(); }
+  if (baselineVisualResults !== null) {
+    lastVisualResults = baselineVisualResults;
+    lastVisualLatencyMs = baselineVisualLatencyMs;
+  }
   renderVisualResults();
+  if (!lastVisualResults.length) {
+    const scopedBaseline = baselineVisualScope?.startsWith('on:') && baselineVisualScope !== 'on:';
+    statusEl.textContent = baselineVisualResults !== null ? `0 visual results · ${scopedBaseline ? 'scoped ' : ''}baseline restored` : 'No visual search yet.';
+  }
   updateFilterSummary();
 }
 
@@ -645,7 +734,7 @@ function renderEvidence() {
   const ocrMatches = narrowMatches(activeCombinedFilter.ocr?.matches || []);
   const asrMatches = narrowMatches(activeCombinedFilter.asr?.matches || []);
   const evidenceCount = ocrMatches.length + asrMatches.length;
-  const evidenceLabel = intersectionOnly ? `Matched evidence (${evidenceCount} in intersection)` : (activeCombinedFilter.direct ? 'Direct corpus evidence' : 'Evidence within visual candidates');
+  const evidenceLabel = intersectionOnly ? `Matched evidence (${evidenceCount} in intersection)` : (activeCombinedFilter.direct ? 'Direct corpus evidence' : 'Evidence across OCR/ASR matches');
   csvResultsBar.hidden = false;
   csvResultsBar.innerHTML = `<div class="evidence-summary"><span>${evidenceLabel}</span><b>${activeCombinedFilter.videoSet.size} combined videos · ${activeCombinedFilter.mode.toUpperCase()}</b></div><div class="evidence-groups">${activeCombinedFilter.ocr ? `<div class="evidence-group"><h4><span class="modality-badge ocr">OCR</span> ${ocrMatches.length}${intersectionOnly ? ' in intersection' : ''} visual-text matches</h4><div class="snippet-list">${ocrMatches.slice(0, 24).map((match, index) => evidenceChip(match, index, 'ocr')).join('') || '<span class="field-hint">No OCR matches</span>'}</div></div>` : ''}${activeCombinedFilter.asr ? `<div class="evidence-group"><h4><span class="modality-badge asr">ASR</span> ${asrMatches.length}${intersectionOnly ? ' in intersection' : ''} spoken-transcript matches</h4><div class="snippet-list">${asrMatches.slice(0, 24).map((match, index) => evidenceChip(match, index, 'asr')).join('') || '<span class="field-hint">No ASR matches</span>'}</div></div>` : ''}</div>`;
   $$('.snippet-chip', csvResultsBar).forEach((chip) => chip.addEventListener('click', () => {
@@ -691,7 +780,7 @@ $$('[data-mode]').forEach((button) => button.addEventListener('click', () => {
   combineMode = button.dataset.mode;
   localStorage.setItem('spatialKis.filterCombineMode', combineMode);
   $$('[data-mode]').forEach((item) => { const active = item.dataset.mode === combineMode; item.classList.toggle('active', active); item.setAttribute('aria-pressed', String(active)); });
-  const signature = visualSignature();
+  const signature = scopeSignature();
   const ocrQuery = csvQueryInput?.value.trim() || '';
   const asrQuery = asrQueryInput?.value.trim() || '';
   const missingCachedResult = (ocrQuery && !modalityCaches.ocr.has(cacheKey(signature, ocrQuery)))
@@ -729,8 +818,8 @@ async function runSearch() {
   if (generation !== visualGeneration) return;
   const conditions = getConditions();
   if (!conditions.length) { statusEl.textContent = 'Enter at least one visual condition.'; return; }
-  const scope = $('#use-video-filter')?.checked ? $('#video-filter-input')?.value.trim() : '';
-  const videoFilter = scope.split(/[\s,;]+/).map((value) => value.trim()).filter(Boolean);
+  const videoFilter = getScopeFilterTokens();
+  const searchScope = scopeSignature();
   const request = { conditions, result_limit: 120, diversify: Boolean($('#diversify')?.checked), expand: Boolean($('#expand')?.checked), max_temporal_gap: Number($('#temporal-gap')?.value) || 45, video_filter: videoFilter.length ? videoFilter : null };
   statusEl.textContent = 'Searching visual keyframes…';
   const searchButton = $('#search');
@@ -743,6 +832,9 @@ async function runSearch() {
     if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`);
     lastVisualResults = data.results || [];
     lastVisualLatencyMs = Math.round(performance.now() - started);
+    baselineVisualResults = lastVisualResults;
+    baselineVisualLatencyMs = lastVisualLatencyMs;
+    baselineVisualScope = searchScope;
     activeCombinedFilter = null;
     if (csvResultsBar) csvResultsBar.hidden = true;
     if (evidenceSection) evidenceSection.hidden = true;
@@ -808,13 +900,12 @@ function renderVisualResults() {
   if (!results) return;
   results.replaceChildren();
   let visible = lastVisualResults;
-  if (activeCombinedFilter && !activeCombinedFilter.direct) visible = visible.filter((item) => activeCombinedFilter.videoSet.has((item.video_stem || cleanVideoStem(item.video_id)).toUpperCase()));
   const beforeHide = visible.length;
   if (hideSubmitted) visible = visible.filter((item) => !itemIsSubmitted(item));
   visible.forEach((item) => results.append(createResultCard(item)));
   if (resultCount) resultCount.textContent = `${visible.length}${hideSubmitted && beforeHide !== visible.length ? ` / ${beforeHide}` : ''} results`;
   if (lastVisualResults.length) {
-    const filteredLabel = activeCombinedFilter && !activeCombinedFilter.direct ? ` · ${activeCombinedFilter.videoSet.size}/${getVisualCandidateVideos().length} videos after ${activeCombinedFilter.mode.toUpperCase()}` : '';
+    const filteredLabel = activeCombinedFilter && !activeCombinedFilter.direct ? ` · searched inside ${activeCombinedFilter.videoSet.size} videos after ${activeCombinedFilter.mode.toUpperCase()}` : '';
     statusEl.textContent = `${visible.length} visual results · ${getVisualCandidateVideos().length} videos · ${lastVisualLatencyMs} ms${filteredLabel}`;
   }
 }

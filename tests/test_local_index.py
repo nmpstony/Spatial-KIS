@@ -17,6 +17,27 @@ def test_clean_video_name_strips_extension_and_directory():
     assert clean_video_name("L02_V010") == "L02_V010"
 
 
+def test_resolve_allowed_videos_supports_ranges_and_exact_stem_lists():
+    idx = LocalMemmapIndex.__new__(LocalMemmapIndex)
+    idx.by_video = {
+        "L01_V001": [],
+        "L01_V0010": [],
+        "L02_V003": [],
+        "L21_V001": [],
+        "L22_V002": [],
+        "L23_V003": [],
+        "L24_V004": [],
+        "L25_V005": [],
+    }
+
+    assert idx.resolve_allowed_videos(["L21-L24"]) == {
+        "L21_V001", "L22_V002", "L23_V003", "L24_V004"
+    }
+    assert idx.resolve_allowed_videos(["L01_V001", "L02_V003"]) == {
+        "L01_V001", "L02_V003"
+    }
+
+
 def test_local_memmap_index_builds_and_searches():
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         root = Path(tmp)

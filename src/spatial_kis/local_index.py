@@ -187,11 +187,14 @@ class LocalMemmapIndex:
                 tokens.append(cleaned)
         if not tokens:
             return None
+        token_set = set(tokens)
+        full_stem_re = re.compile(r"^L\d{2}_V\d{3}$")
+        prefix_tokens = [tok for tok in token_set if not full_stem_re.fullmatch(tok)]
         allowed: set[str] = set()
         for stem in self.by_video:
             clean_st = clean_video_name(stem)
             stem_up = clean_st.upper()
-            if any(stem_up == tok or stem_up.startswith(tok + "_") or stem_up.startswith(tok) for tok in tokens):
+            if stem_up in token_set or any(stem_up.startswith(tok) for tok in prefix_tokens):
                 allowed.add(clean_st)
         return allowed
 

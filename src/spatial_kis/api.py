@@ -59,7 +59,7 @@ class Condition(BaseModel):
 class SearchRequest(BaseModel):
     conditions: list[Condition] = Field(min_length=1, max_length=12)
     top_k: int = Field(default=300, ge=20, le=2048)
-    result_limit: int = Field(default=60, ge=1, le=200)
+    result_limit: int = Field(default=60, ge=1, le=500)
     diversify: bool = True
     expand: bool = True
     max_temporal_gap: float = Field(default=45.0, ge=1.0, le=300.0)
