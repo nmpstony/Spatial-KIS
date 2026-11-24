@@ -288,13 +288,13 @@ def _warmup_models() -> None:
 
     def _bg() -> None:
         try:
-            get_expander()
             encoder()
-            csv_engine()
-            asr_engine()
             if use_local_engine():
                 eng = local_engine()
                 eng._region_tensor_fp32(0)
+            asr_engine()
+            csv_engine()
+            get_expander()
         except Exception:
             pass
 

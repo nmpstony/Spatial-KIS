@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from types import SimpleNamespace
 
 import pytest
+import torch
 
 import spatial_kis.expander as expander_module
 
@@ -48,10 +50,23 @@ class FakeModel:
         return [[1, 2, 3]]
 
 
+class FakeModuleModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.projection = torch.nn.Linear(2, 2)
+        self.generation_config = SimpleNamespace(max_length=20)
+        self.generate_kwargs = None
+
+    def generate(self, **kwargs):
+        self.generate_kwargs = kwargs
+        return [[1, 2, 3]]
+
+
 def install_factories(monkeypatch, tokenizer_factory, model_factory):
     tokenizer_calls = []
     model_calls = []
     monkeypatch.delenv("SPATIAL_KIS_TRANSLATION_MODEL", raising=False)
+    monkeypatch.delenv("SPATIAL_KIS_QUANTIZE_TRANSLATOR", raising=False)
 
     def load_tokenizer(model_name, **kwargs):
         tokenizer_calls.append((model_name, kwargs))
@@ -93,7 +108,7 @@ def test_default_vinai_model_sets_languages_and_decoder_token(monkeypatch, token
     )
     assert tokenizer.src_lang == "vi_VN"
     assert model.generate_kwargs["decoder_start_token_id"] == expected_decoder_id
-    assert model.generate_kwargs["num_beams"] == 3
+    assert model.generate_kwargs["num_beams"] == 1
     assert model.generate_kwargs["early_stopping"] is True
     assert model.generate_kwargs["max_new_tokens"] == 64
     assert model.generate_kwargs["do_sample"] is False
@@ -138,3 +153,53 @@ def test_cleaning_cano_post_replacement_and_variants_deduplication(monkeypatch):
     service.translate = lambda _text: "CANO VỀ ĐÍCH"
     monkeypatch.setattr(expander_module, "_EXPANDER_INSTANCE", service)
     assert expander_module.variants("cano về đích") == ["cano về đích"]
+
+
+def test_cpu_quantizes_module_and_uses_greedy_decoding(monkeypatch):
+    tokenizer = FakeTokenizer(language_ids={"en_XX": 42})
+    model = FakeModuleModel()
+    quantize_calls = []
+    install_factories(monkeypatch, lambda _name, _kwargs: tokenizer, lambda _name, _kwargs: model)
+
+    def quantize_dynamic(candidate, module_types, *, dtype):
+        quantize_calls.append((candidate, module_types, dtype))
+        return candidate
+
+    monkeypatch.setattr(expander_module.torch.ao.quantization, "quantize_dynamic", quantize_dynamic)
+
+    service = expander_module.LocalExpander()
+    service.translate("về đích")
+
+    assert quantize_calls == [(model, {torch.nn.Linear}, torch.qint8)]
+    assert model.generation_config.max_length is None
+    assert model.generate_kwargs["num_beams"] == 1
+
+
+def test_cpu_quantization_can_be_disabled(monkeypatch):
+    tokenizer = FakeTokenizer()
+    model = FakeModuleModel()
+    install_factories(monkeypatch, lambda _name, _kwargs: tokenizer, lambda _name, _kwargs: model)
+    monkeypatch.setenv("SPATIAL_KIS_QUANTIZE_TRANSLATOR", "0")
+    quantize_dynamic = lambda *_args, **_kwargs: pytest.fail("quantization should be disabled")
+    monkeypatch.setattr(expander_module.torch.ao.quantization, "quantize_dynamic", quantize_dynamic)
+
+    service = expander_module.LocalExpander(expander_module.FALLBACK_MODEL)
+    service.translate("người chạy")
+
+    assert model.generate_kwargs["num_beams"] == 1
+
+
+def test_cuda_uses_beam_search_without_quantization(monkeypatch):
+    tokenizer = FakeTokenizer(language_ids={"en_XX": 42})
+    model = FakeModuleModel()
+    install_factories(monkeypatch, lambda _name, _kwargs: tokenizer, lambda _name, _kwargs: model)
+    monkeypatch.setattr(expander_module.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(model, "to", lambda _device: model)
+    quantize_dynamic = lambda *_args, **_kwargs: pytest.fail("CUDA model should not be quantized")
+    monkeypatch.setattr(expander_module.torch.ao.quantization, "quantize_dynamic", quantize_dynamic)
+
+    service = expander_module.LocalExpander()
+    service.translate("về đích")
+
+    assert service.device.type == "cuda"
+    assert model.generate_kwargs["num_beams"] == 3

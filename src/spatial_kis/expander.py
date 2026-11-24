@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import threading
+import warnings
 from functools import lru_cache
 
 import torch
@@ -102,6 +103,32 @@ class LocalExpander:
                     model_name,
                     local_files_only=local_files_only,
                 ).to(self.device).eval()
+                try:
+                    generation_config = getattr(model, "generation_config", None)
+                    if generation_config is not None and hasattr(generation_config, "max_length"):
+                        generation_config.max_length = None
+                except Exception:
+                    logger.debug("Could not clear translator generation_config.max_length", exc_info=True)
+                if (
+                    self.device.type != "cuda"
+                    and os.getenv("SPATIAL_KIS_QUANTIZE_TRANSLATOR", "1").strip().lower()
+                    not in ("0", "false", "no")
+                    and isinstance(model, torch.nn.Module)
+                    and hasattr(torch, "ao")
+                    and hasattr(torch.ao, "quantization")
+                ):
+                    unquantized_model = model
+                    try:
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore", DeprecationWarning)
+                            model = torch.ao.quantization.quantize_dynamic(
+                                model,
+                                {torch.nn.Linear},
+                                dtype=torch.qint8,
+                            )
+                    except Exception as error:
+                        model = unquantized_model
+                        logger.warning("Could not dynamically quantize translation model: %s", error)
                 return tokenizer, model
             except Exception as error:
                 last_error = error
@@ -131,7 +158,7 @@ class LocalExpander:
             tokens = self.tokenizer([cleaned], return_tensors="pt", truncation=True).to(self.device)
             generate_kwargs = {
                 "max_new_tokens": 64,
-                "num_beams": 3,
+                "num_beams": 3 if self.device.type == "cuda" else 1,
                 "early_stopping": True,
                 "do_sample": False,
             }
