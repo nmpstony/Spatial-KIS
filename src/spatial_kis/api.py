@@ -4,10 +4,11 @@ import json
 import os
 import re
 import tempfile
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
-from functools import lru_cache
+from functools import wraps
 from pathlib import Path
 
 import torch
@@ -46,6 +47,30 @@ VIDEO_ROOT = find_video_root()
 MILVUS_URI = os.environ.get("MILVUS_URI", "http://localhost:19530")
 BACKEND_MODE = os.environ.get("SPATIAL_KIS_BACKEND", "auto").lower()
 HISTORY_PATH = ARTIFACT / "session_history.jsonl"
+
+
+def _synchronized_singleton(fn):
+    """Cache a no-argument factory while serializing its first invocation."""
+    lock = threading.Lock()
+    missing = object()
+    value = missing
+
+    @wraps(fn)
+    def wrapper():
+        nonlocal value
+        if value is missing:
+            with lock:
+                if value is missing:
+                    value = fn()
+        return value
+
+    def cache_clear() -> None:
+        nonlocal value
+        with lock:
+            value = missing
+
+    wrapper.cache_clear = cache_clear
+    return wrapper
 
 
 class Condition(BaseModel):
@@ -139,12 +164,12 @@ class Encoder:
         return [self._cache[k] for k in keys]
 
 
-@lru_cache
+@_synchronized_singleton
 def encoder() -> Encoder:
     return Encoder()
 
 
-@lru_cache
+@_synchronized_singleton
 def state() -> dict:
     try:
         return json.loads((ARTIFACT / "active_index.json").read_text(encoding="utf-8"))
@@ -154,22 +179,22 @@ def state() -> dict:
         raise RuntimeError("No active_index.json or manifest.jsonl found in artifact.") from error
 
 
-@lru_cache
+@_synchronized_singleton
 def client() -> MilvusClient:
     return MilvusClient(uri=MILVUS_URI)
 
 
-@lru_cache
+@_synchronized_singleton
 def local_engine() -> LocalMemmapIndex:
     return LocalMemmapIndex(ARTIFACT)
 
 
-@lru_cache
+@_synchronized_singleton
 def csv_engine() -> CsvSearchEngine:
     return CsvSearchEngine(ARTIFACT, source="ocr")
 
 
-@lru_cache
+@_synchronized_singleton
 def asr_engine() -> CsvSearchEngine:
     return CsvSearchEngine(ARTIFACT, source="asr")
 
@@ -283,7 +308,6 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.on_event("startup")
 def _warmup_models() -> None:
-    import threading
     from .expander import expander as get_expander
 
     def _bg() -> None:
@@ -292,9 +316,9 @@ def _warmup_models() -> None:
             if use_local_engine():
                 eng = local_engine()
                 eng._region_tensor_fp32(0)
+            get_expander()
             asr_engine()
             csv_engine()
-            get_expander()
         except Exception:
             pass
 

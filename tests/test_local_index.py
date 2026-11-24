@@ -1,6 +1,9 @@
 import json
 import gc
 import tempfile
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import numpy as np
 from spatial_kis.local_index import (
@@ -303,6 +306,95 @@ def test_asr_tokenizer_keeps_normalized_and_raw_tokens_aligned():
     assert len(segments) == len(raw_segments)
     assert "coeur" in segments[0]
     assert "cœur" in raw_segments[0]
+
+
+def test_api_csv_singletons_construct_once_under_concurrency(monkeypatch):
+    try:
+        from spatial_kis import api
+    except (ImportError, RuntimeError) as exc:
+        import pytest
+
+        pytest.skip(f"FastAPI backend dependencies unavailable: {exc}")
+
+    counts = {"ocr": 0, "asr": 0}
+    count_lock = threading.Lock()
+
+    def fake_csv_engine(artifact_root, source="ocr"):
+        with count_lock:
+            counts[source] += 1
+        time.sleep(0.03)
+        return object()
+
+    monkeypatch.setattr(api, "CsvSearchEngine", fake_csv_engine)
+    api.csv_engine.cache_clear()
+    api.asr_engine.cache_clear()
+    try:
+        for factory, source in ((api.csv_engine, "ocr"), (api.asr_engine, "asr")):
+            barrier = threading.Barrier(6)
+
+            def get_engine():
+                barrier.wait()
+                return factory()
+
+            with ThreadPoolExecutor(max_workers=6) as executor:
+                engines = list(executor.map(lambda _: get_engine(), range(6)))
+
+            assert all(engine is engines[0] for engine in engines)
+            assert counts[source] == 1
+
+            factory.cache_clear()
+            assert factory() is not engines[0]
+            assert counts[source] == 2
+    finally:
+        api.csv_engine.cache_clear()
+        api.asr_engine.cache_clear()
+
+
+def test_region_tensor_cache_is_thread_safe_and_per_instance(monkeypatch):
+    from spatial_kis import local_index
+
+    first = LocalMemmapIndex.__new__(LocalMemmapIndex)
+    second = LocalMemmapIndex.__new__(LocalMemmapIndex)
+    first._fp32_lock = threading.Lock()
+    first._fp32_cache = {}
+    second._fp32_lock = threading.Lock()
+    second._fp32_cache = {}
+    first_source = np.ones((2, 3), dtype=np.float16)
+    second_source = np.full((2, 3), 2, dtype=np.float16)
+    first._mmaps = {0: first_source}
+    second._mmaps = {0: second_source}
+
+    original_array = local_index.np.array
+    loads = {id(first_source): 0, id(second_source): 0}
+    load_lock = threading.Lock()
+
+    def counted_array(source, *args, **kwargs):
+        if id(source) in loads:
+            with load_lock:
+                loads[id(source)] += 1
+            time.sleep(0.03)
+        return original_array(source, *args, **kwargs)
+
+    monkeypatch.setattr(local_index.np, "array", counted_array)
+    barrier = threading.Barrier(6)
+
+    def load_first():
+        barrier.wait()
+        return first._region_tensor_fp32(0)
+
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        tensors = list(executor.map(lambda _: load_first(), range(6)))
+
+    assert all(tensor is tensors[0] for tensor in tensors)
+    assert loads[id(first_source)] == 1
+
+    second_tensor = second._region_tensor_fp32(0)
+    assert loads[id(second_source)] == 1
+    first._region_tensor_fp32.cache_clear()
+    assert first._region_tensor_fp32(0) is not tensors[0]
+    assert loads[id(first_source)] == 2
+    assert second._region_tensor_fp32(0) is second_tensor
+    assert loads[id(second_source)] == 1
 
 
 def test_api_csv_and_asr_helpers_preserve_intervals_and_upload_prefixes(monkeypatch):

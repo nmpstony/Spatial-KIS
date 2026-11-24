@@ -5,9 +5,10 @@ import fnmatch
 import logging
 import pickle
 import re
+import threading
 import unicodedata
 from collections import defaultdict
-from functools import lru_cache
+from functools import update_wrapper
 from pathlib import Path
 from typing import Iterable
 
@@ -25,10 +26,52 @@ def clean_video_name(video_id: str) -> str:
     return name[:-4] if name.lower().endswith(".mp4") else name
 
 
+class _BoundPerInstanceCache:
+    def __init__(self, descriptor: "_PerInstanceCache", instance: object) -> None:
+        self._descriptor = descriptor
+        self._instance = instance
+
+    def __call__(self, region_id: int = 0) -> torch.Tensor:
+        return self._descriptor._call(self._instance, region_id)
+
+    def cache_clear(self) -> None:
+        self._descriptor._clear(self._instance)
+
+
+class _PerInstanceCache:
+    """One-entry, per-instance cache exposing a bound ``cache_clear`` method."""
+
+    def __init__(self, fn) -> None:
+        self._fn = fn
+        update_wrapper(self, fn)
+
+    def __get__(self, instance, owner):
+        if instance is None:
+            return self
+        return _BoundPerInstanceCache(self, instance)
+
+    def _call(self, instance, region_id: int) -> torch.Tensor:
+        with instance._fp32_lock:
+            cached = instance._fp32_cache.get(region_id)
+            if cached is not None:
+                return cached
+            value = self._fn(instance, region_id)
+            instance._fp32_cache.clear()
+            instance._fp32_cache[region_id] = value
+            return value
+
+    @staticmethod
+    def _clear(instance) -> None:
+        with instance._fp32_lock:
+            instance._fp32_cache.clear()
+
+
 class LocalMemmapIndex:
     """Zero-Docker memory-mapped exact vector search engine for Spatial-KIS."""
 
     def __init__(self, artifact_root: Path) -> None:
+        self._fp32_lock = threading.Lock()
+        self._fp32_cache: dict[int, torch.Tensor] = {}
         self.artifact_root = artifact_root
         self.index_dir = artifact_root / "memmap_index"
         self.meta_path = self.index_dir / "meta.json"
@@ -120,7 +163,7 @@ class LocalMemmapIndex:
         )
         print(f"[LocalMemmapIndex] Built {count:,} keyframes x 10 regions ({dim}D).", flush=True)
 
-    @lru_cache(maxsize=1)
+    @_PerInstanceCache
     def _region_tensor_fp32(self, region_id: int = 0) -> torch.Tensor:
         """Keep region 0 (full frame) permanently in float32 RAM (~1.29 GB) for sub-100ms BLAS matmul."""
         arr = np.array(self._mmaps[region_id], dtype=np.float32, copy=True)
@@ -875,6 +918,7 @@ class CsvSearchEngine:
         source: str = "ocr",
         patterns: tuple[str, ...] | None = None,
     ) -> None:
+        self._lock = threading.RLock()
         self.artifact_root = Path(artifact_root)
         self.source = source
         self.patterns = patterns if patterns is not None else (("asr*.csv",) if source == "asr" else ("ocr*.csv",))
@@ -905,6 +949,10 @@ class CsvSearchEngine:
         return sorted(files, key=lambda path: (str(path.parent).lower(), path.name.lower()))
 
     def reload_if_needed(self, force: bool = False) -> None:
+        with self._lock:
+            self._reload_if_needed(force)
+
+    def _reload_if_needed(self, force: bool = False) -> None:
         import csv
 
         csv_files = self._discover_csv_files()
@@ -1115,14 +1163,15 @@ class CsvSearchEngine:
         self._mtimes = current_mtimes
 
     def status(self) -> dict:
-        self.reload_if_needed()
-        unique_vids = len({r["video_stem"] for r in self.rows})
-        return {
-            "source": self.source,
-            "total_rows": len(self.rows),
-            "unique_videos": unique_vids,
-            "files": self.files_info,
-        }
+        with self._lock:
+            self.reload_if_needed()
+            unique_vids = len({r["video_stem"] for r in self.rows})
+            return {
+                "source": self.source,
+                "total_rows": len(self.rows),
+                "unique_videos": unique_vids,
+                "files": self.files_info,
+            }
 
     def _candidate_row_indices(
         self,
@@ -1300,6 +1349,16 @@ class CsvSearchEngine:
         return sorted(cand_set)
 
     def search(
+        self,
+        query: str,
+        limit: int = 80,
+        allowed_videos: set[str] | None = None,
+        fuzzy: bool = True,
+    ) -> dict:
+        with self._lock:
+            return self._search_unlocked(query, limit, allowed_videos, fuzzy)
+
+    def _search_unlocked(
         self,
         query: str,
         limit: int = 80,
