@@ -658,8 +658,14 @@ function renderEvidence() {
 
 function matchToItem(match) {
   const source = match.source || (match.end_timestamp != null ? 'asr' : 'ocr');
-  const timestamp = Number(match.timestamp || 0);
-  return { ...match, source, video_stem: match.video_id, keyframe_id: `${match.video_id}:${match.frame_id ?? Math.round(timestamp * 25)}`, frame_id: match.frame_id ?? Math.round(timestamp * 25), timestamp, timestamp_ms: match.timestamp_ms != null ? Number(match.timestamp_ms) : Math.round(timestamp * 1000), fps: 25, score: Number(match.match_score ?? 1) };
+  const segment_start = Number(match.timestamp || 0);
+  const segment_end = match.end_timestamp != null ? Number(match.end_timestamp) : null;
+  const keyframeTimestamp = match.keyframe_timestamp != null ? Number(match.keyframe_timestamp) : NaN;
+  const hasKeyframeTimestamp = Number.isFinite(keyframeTimestamp);
+  const timestamp = hasKeyframeTimestamp ? keyframeTimestamp : segment_start;
+  const timestamp_ms = hasKeyframeTimestamp ? Math.round(timestamp * 1000) : match.timestamp_ms != null ? Number(match.timestamp_ms) : Math.round(segment_start * 1000);
+  const fps = Number(match.fps) || 25;
+  return { ...match, source, video_stem: match.video_id, keyframe_id: `${match.video_id}:${match.frame_id ?? Math.round(timestamp * fps)}`, frame_id: match.frame_id ?? Math.round(timestamp * fps), timestamp, timestamp_ms, segment_start, segment_end, fps, score: Number(match.match_score ?? 1) };
 }
 
 function renderEvidenceCards() {
@@ -781,7 +787,7 @@ function createResultCard(item, options = {}) {
     : null;
   const textMatch = options.evidence ? item : evidenceMatch;
   const textClass = (textMatch?.source || source) === 'asr' ? 'asr-text-snippet' : '';
-  const interval = source === 'asr' ? `${formatTime(timestamp, true)}–${formatTime(item.end_timestamp ?? timestamp, true)}` : `#${item.frame_id ?? Math.round(timestamp * 25)}`;
+  const interval = source === 'asr' ? `${formatTime(item.segment_start ?? timestamp, true)}–${formatTime(item.segment_end ?? item.end_timestamp ?? item.segment_start ?? timestamp, true)}` : `#${item.frame_id ?? Math.round(timestamp * 25)}`;
   const primaryFrame = item.frame_id ?? Math.round(timestamp * 25);
   const stage1Caption = preview.nextList.length ? `<div class="card-submeta scene-caption"><span class="card-tag">Scene 1</span><span>${ms} ms</span><span>· #${escapeHtml(String(primaryFrame))}</span></div>` : '';
   card.innerHTML = `${image ? `<img class="stage1-img" src="${image}" alt="${escapeHtml(stem)} scene 1 at ${ms} ms" loading="lazy">` : `<div class="card-media audio-placeholder" role="img" aria-label="No keyframe available"></div>`}${stage1Caption}${preview.html}<div class="card-meta"><span class="video-pill">${escapeHtml(stem)}</span><span class="ms-pill">${ms} ms</span></div><div class="card-submeta"><span>${formatTime(timestamp)}</span><span>· ${escapeHtml(interval)}</span>${source === 'visual' ? `<span>· Score <b>${Number(item.score || 0).toFixed(3)}</b></span><span class="card-tag">${escapeHtml(REGION_NAMES[item.region_id] || item.region_id || 'all')}</span>` : `<span class="modality-badge ${source}">${source.toUpperCase()}</span><span>${escapeHtml(item.match_type || 'match')}</span>`}</div>${textMatch?.text ? `<div class="ocr-text-snippet ${textClass}">${escapeHtml(textMatch.text)}</div>` : ''}<div class="card-actions"><button type="button" class="view-btn">Inspect</button><button type="button" class="secondary-btn copy-btn">Copy</button></div><div class="card-submit-row"><button type="button" class="submit-kis kis-btn" data-submission="${escapeHtml(`${stem.toUpperCase()}|${ms}`)}">KIS</button><button type="button" class="submit-qa qa-btn" data-submission="${escapeHtml(`${stem.toUpperCase()}|${ms}`)}">Q&amp;A</button></div>`;
@@ -832,18 +838,28 @@ function closeInspect() {
   if (inspect?.open) inspect.close();
 }
 
+function currentInspectSeconds() {
+  if (player && player.readyState >= 1 && Number.isFinite(player.currentTime)) return Math.max(0, player.currentTime);
+  return Math.max(0, Number(currentInspectItem?.timestamp || 0));
+}
+
 function stepVideo(deltaSeconds) {
   if (!player) return;
   segmentPlayback = false;
   player.pause();
-  player.currentTime = Math.max(0, Math.min(Number.isFinite(player.duration) ? player.duration : Infinity, (player.currentTime || 0) + deltaSeconds));
+  player.currentTime = Math.max(0, Math.min(Number.isFinite(player.duration) ? player.duration : Infinity, currentInspectSeconds() + deltaSeconds));
   updateLiveTelemetry();
+}
+
+function stepFrames(deltaFrames) {
+  const fps = Number(currentInspectItem?.fps) || 25;
+  stepVideo(deltaFrames / fps);
 }
 
 function updateLiveTelemetry() {
   if (!player || !currentInspectItem || !details) return;
   const fps = Number(currentInspectItem.fps || 25);
-  const seconds = player.currentTime || Number(currentInspectItem.timestamp || 0);
+  const seconds = currentInspectSeconds();
   const ms = Math.round(seconds * 1000);
   const stem = cleanVideoStem(currentInspectItem.video_id);
   const qa = qaAnswerInput?.value.trim() || '';
@@ -886,21 +902,22 @@ async function inspectResult(item) {
   currentInspectItem = item;
   segmentPlayback = false;
   const source = item.source || 'visual';
-  const start = Math.max(0, Number(item.timestamp || 0));
-  const end = Number(item.end_timestamp);
+  const keyframeTime = Math.max(0, Number(item.timestamp || 0));
+  const segmentStart = Math.max(0, Number(item.segment_start ?? item.timestamp ?? 0));
+  const segmentEnd = Number(item.segment_end ?? item.end_timestamp);
   const transcript = $('#modal-transcript');
   const segmentButton = $('#play-segment-btn');
   const modality = $('#modal-modality');
   if (modality) { modality.textContent = source.toUpperCase(); modality.className = `modality-badge ${source === 'visual' ? '' : source}`; }
-  $('#modal-title').textContent = `${cleanVideoStem(item.video_id)} · ${formatTime(start)}`;
+  $('#modal-title').textContent = `${cleanVideoStem(item.video_id)} · ${formatTime(keyframeTime)}`;
   if (transcript) {
     transcript.hidden = !item.text;
-    transcript.textContent = item.text ? `${source === 'asr' ? `[${formatTime(start, true)} – ${formatTime(Number.isFinite(end) ? end : start, true)}] ` : ''}${item.text}` : '';
+    transcript.textContent = item.text ? `${source === 'asr' ? `[${formatTime(segmentStart, true)} – ${formatTime(Number.isFinite(segmentEnd) ? segmentEnd : segmentStart, true)}] ` : ''}${item.text}` : '';
   }
-  if (segmentButton) segmentButton.hidden = source !== 'asr' || !Number.isFinite(end) || end <= start;
+  if (segmentButton) segmentButton.hidden = source !== 'asr' || !Number.isFinite(segmentEnd) || segmentEnd <= segmentStart;
   player.pause();
   player.src = `/media/video/${encodeURIComponent(item.video_id)}`;
-  player.onloadedmetadata = () => { player.currentTime = start; updateLiveTelemetry(); player.play().catch(() => {}); };
+  player.onloadedmetadata = () => { player.currentTime = keyframeTime; updateLiveTelemetry(); player.play().catch(() => {}); };
   updateLiveTelemetry();
   if (!inspect.open) inspect.showModal();
   await loadNeighbors(item, neighborsAbortController.signal);
@@ -908,21 +925,23 @@ async function inspectResult(item) {
 
 player?.addEventListener('timeupdate', () => {
   updateLiveTelemetry();
-  if (segmentPlayback && currentInspectItem && Number.isFinite(Number(currentInspectItem.end_timestamp)) && player.currentTime >= Number(currentInspectItem.end_timestamp)) { player.pause(); segmentPlayback = false; $('#play-segment-btn').textContent = 'Play segment'; }
+  const segmentEnd = Number(currentInspectItem?.segment_end ?? currentInspectItem?.end_timestamp);
+  if (segmentPlayback && Number.isFinite(segmentEnd) && player.currentTime >= segmentEnd) { player.pause(); segmentPlayback = false; $('#play-segment-btn').textContent = 'Play segment'; }
 });
 ['seeking', 'seeked', 'pause', 'loadedmetadata'].forEach((eventName) => player?.addEventListener(eventName, updateLiveTelemetry));
 $('#play-segment-btn')?.addEventListener('click', () => {
   if (!currentInspectItem) return;
   if (segmentPlayback) { player.pause(); segmentPlayback = false; $('#play-segment-btn').textContent = 'Play segment'; }
-  else { player.currentTime = Number(currentInspectItem.timestamp || 0); segmentPlayback = true; $('#play-segment-btn').textContent = 'Stop segment'; player.play().catch(() => { segmentPlayback = false; }); }
+  else { player.currentTime = Math.max(0, Number(currentInspectItem.segment_start ?? currentInspectItem.timestamp ?? 0)); segmentPlayback = true; $('#play-segment-btn').textContent = 'Stop segment'; player.play().catch(() => { segmentPlayback = false; }); }
 });
 $$('[data-step]').forEach((button) => button.addEventListener('click', () => stepVideo(Number(button.dataset.step))));
+$$('[data-frame-step]').forEach((button) => button.addEventListener('click', () => stepFrames(Number(button.dataset.frameStep))));
 $('#inspect-close-btn')?.addEventListener('click', closeInspect);
 inspect?.addEventListener('close', () => { segmentPlayback = false; player?.pause(); });
 inspect?.addEventListener('click', (event) => { if (event.target === inspect) closeInspect(); });
-$('#modal-copy-btn')?.addEventListener('click', () => { if (currentInspectItem) copyPayload(cleanVideoStem(currentInspectItem.video_id), Math.round((player.currentTime || currentInspectItem.timestamp || 0) * 1000)).catch(() => {}); });
-$('#modal-submit-kis')?.addEventListener('click', () => { if (currentInspectItem) submitToDres(currentInspectItem.video_id, Math.round((player.currentTime || currentInspectItem.timestamp || 0) * 1000), 'kis'); });
-$('#modal-submit-qa')?.addEventListener('click', () => { if (currentInspectItem) submitToDres(currentInspectItem.video_id, Math.round((player.currentTime || currentInspectItem.timestamp || 0) * 1000), 'qa'); });
+$('#modal-copy-btn')?.addEventListener('click', () => { if (currentInspectItem) copyPayload(cleanVideoStem(currentInspectItem.video_id), Math.round(currentInspectSeconds() * 1000)).catch(() => {}); });
+$('#modal-submit-kis')?.addEventListener('click', () => { if (currentInspectItem) submitToDres(currentInspectItem.video_id, Math.round(currentInspectSeconds() * 1000), 'kis'); });
+$('#modal-submit-qa')?.addEventListener('click', () => { if (currentInspectItem) submitToDres(currentInspectItem.video_id, Math.round(currentInspectSeconds() * 1000), 'qa'); });
 
 document.addEventListener('keydown', (event) => {
   if (event.isComposing || event.keyCode === 229) return;
@@ -937,15 +956,15 @@ document.addEventListener('keydown', (event) => {
   if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
     event.preventDefault();
     const mode = event.shiftKey ? 'qa' : 'kis';
-    if (currentInspectItem) submitToDres(currentInspectItem.video_id, Math.round((player.currentTime || currentInspectItem.timestamp || 0) * 1000), mode);
+    if (currentInspectItem) submitToDres(currentInspectItem.video_id, Math.round(currentInspectSeconds() * 1000), mode);
     return;
   }
-  if (!event.ctrlKey && !event.metaKey && event.key.toLowerCase() === 'c') { event.preventDefault(); if (currentInspectItem) copyPayload(cleanVideoStem(currentInspectItem.video_id), Math.round((player.currentTime || currentInspectItem.timestamp || 0) * 1000)).catch(() => {}); return; }
+  if (!event.ctrlKey && !event.metaKey && event.key.toLowerCase() === 'c') { event.preventDefault(); if (currentInspectItem) copyPayload(cleanVideoStem(currentInspectItem.video_id), Math.round(currentInspectSeconds() * 1000)).catch(() => {}); return; }
   if (event.key === ' ') { event.preventDefault(); player.paused ? player.play().catch(() => {}) : player.pause(); }
   else if (event.key === 'ArrowLeft') { event.preventDefault(); stepVideo(event.shiftKey ? -5 : -1); }
   else if (event.key === 'ArrowRight') { event.preventDefault(); stepVideo(event.shiftKey ? 5 : 1); }
-  else if (event.key === ',') { event.preventDefault(); stepVideo(-0.04); }
-  else if (event.key === '.') { event.preventDefault(); stepVideo(0.04); }
+  else if (event.key === ',') { event.preventDefault(); stepFrames(-1); }
+  else if (event.key === '.') { event.preventDefault(); stepFrames(1); }
 });
 
 window.closeInspect = closeInspect;

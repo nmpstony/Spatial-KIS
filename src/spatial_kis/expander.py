@@ -1,13 +1,19 @@
-"""Vietnamese query expansion with Google Translate engine and local MarianMT fallback."""
+"""Offline-only Vietnamese query expansion with thread-safe initialization and visual prompt normalization."""
 from __future__ import annotations
 
-import json
+import logging
 import os
 import re
 import threading
-import urllib.parse
-import urllib.request
 from functools import lru_cache
+
+import torch
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+
+DEFAULT_MODEL = "vinai/vinai-translate-vi2en-v2"
+FALLBACK_MODEL = "Helsinki-NLP/opus-mt-vi-en"
+logger = logging.getLogger(__name__)
+
 
 # Common Vietnamese prefixes in KIS descriptions that hurt CLIP embeddings if translated literally
 _FILLER_PREFIXES = re.compile(
@@ -15,12 +21,13 @@ _FILLER_PREFIXES = re.compile(
     re.IGNORECASE,
 )
 
+# Vietnamese terms that MarianMT (opus-mt-vi-en) commonly mistranslates (must remain pure Vietnamese here)
 _VI_PRE_REPLACEMENTS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"\b(cano|ca\s*nô|ca-nô)\b", re.IGNORECASE), "thuyền cao tốc"),
     (re.compile(r"\bflycam\b", re.IGNORECASE), "quay từ trên cao"),
     (re.compile(r"\b(mc|biên\s+tập\s+viên|btv)\b", re.IGNORECASE), "người dẫn chương trình truyền hình"),
-    (re.compile(r"\báo\s+dài\b", re.IGNORECASE), "áo dài"),
-    (re.compile(r"\bkhẩu\s+trang\b", re.IGNORECASE), "khẩu trang"),
+    (re.compile(r"\báo\s+dài\b", re.IGNORECASE), "trang phục áo dài truyền thống"),
+    (re.compile(r"\bkhẩu\s+trang\b", re.IGNORECASE), "khẩu trang che mặt"),
 ]
 
 _EN_POST_REPLACEMENTS: list[tuple[re.Pattern, str]] = [
@@ -31,11 +38,6 @@ _EN_POST_REPLACEMENTS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"^there\s+are\s+", re.IGNORECASE), ""),
     (re.compile(r"\bscene\s+at\s+sea\b", re.IGNORECASE), "on the sea"),
 ]
-
-_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-)
 
 
 def clean_vi_prompt(text: str) -> tuple[str, bool]:
@@ -49,110 +51,101 @@ def clean_vi_prompt(text: str) -> tuple[str, bool]:
     return cleaned, has_cano
 
 
-def _google_translate_raw(text: str, timeout: float = 4.0) -> str:
-    """Translate Vietnamese text to English via Google Translate endpoints."""
-    encoded = urllib.parse.quote(text.strip())
-    
-    # 1. Primary: translate.googleapis.com
-    url1 = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=vi&tl=en&dt=t&q={encoded}"
-    req1 = urllib.request.Request(url1, headers={"User-Agent": _USER_AGENT})
-    try:
-        with urllib.request.urlopen(req1, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            if data and isinstance(data, list) and isinstance(data[0], list):
-                translated = "".join(part[0] for part in data[0] if part and part[0]).strip()
-                if translated:
-                    return translated
-    except Exception:
-        pass
-
-    # 2. Secondary fallback: clients5.google.com
-    url2 = f"https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=vi&tl=en&q={encoded}"
-    req2 = urllib.request.Request(url2, headers={"User-Agent": _USER_AGENT})
-    try:
-        with urllib.request.urlopen(req2, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            if isinstance(data, list) and len(data) > 0 and isinstance(data[0], str):
-                return data[0].strip()
-    except Exception:
-        pass
-
-    return ""
-
-
 class LocalExpander:
-    def __init__(self, model_name: str | None = None, engine: str | None = None) -> None:
-        self.engine = (engine or os.getenv("SPATIAL_KIS_TRANSLATION_ENGINE", "google")).lower().strip()
-        self.model_name = model_name or os.getenv("SPATIAL_KIS_TRANSLATION_MODEL", "Helsinki-NLP/opus-mt-vi-en")
+    def __init__(self, model_name: str | None = None) -> None:
+        self.model_name = model_name or os.getenv("SPATIAL_KIS_TRANSLATION_MODEL", DEFAULT_MODEL)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._lock = threading.Lock()
-        self._marian_loaded = False
-        self.tokenizer = None
-        self.model = None
-        self.device = None
+        try:
+            self.tokenizer, self.model = self._load(self.model_name)
+        except Exception as primary_error:
+            if self.model_name == FALLBACK_MODEL:
+                raise
+            logger.warning(
+                "Could not load translation model %s; falling back to %s: %s",
+                self.model_name,
+                FALLBACK_MODEL,
+                primary_error,
+            )
+            self.tokenizer, self.model = self._load(FALLBACK_MODEL)
+            self.model_name = FALLBACK_MODEL
 
-        if self.engine in ("opus", "marian"):
-            self._ensure_marian()
+        self.src_code, self.tgt_code = self._language_codes(self.model_name, self.tokenizer)
 
-    def _ensure_marian(self) -> bool:
-        if self._marian_loaded:
-            return True
-        with self._lock:
-            if self._marian_loaded:
-                return True
+    @staticmethod
+    def _language_codes(model_name: str, tokenizer=None) -> tuple[str | None, str | None]:
+        lowered = model_name.lower()
+        if "nllb" in lowered:
+            return "vie_Latn", "eng_Latn"
+        if (
+            "vinai-translate" in lowered
+            or "mbart" in lowered
+            or isinstance(getattr(tokenizer, "lang_code_to_id", None), dict)
+        ):
+            return "vi_VN", "en_XX"
+        return None, None
+
+    def _load(self, model_name: str):
+        src_code, _ = self._language_codes(model_name)
+        tokenizer_kwargs = {"src_lang": src_code} if src_code else {}
+        last_error: Exception | None = None
+        for local_files_only in (True, False):
             try:
-                import torch
-                from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+                tokenizer = AutoTokenizer.from_pretrained(
+                    model_name,
+                    local_files_only=local_files_only,
+                    **tokenizer_kwargs,
+                )
+                if src_code and hasattr(tokenizer, "src_lang"):
+                    tokenizer.src_lang = src_code
+                model = AutoModelForSeq2SeqLM.from_pretrained(
+                    model_name,
+                    local_files_only=local_files_only,
+                ).to(self.device).eval()
+                return tokenizer, model
+            except Exception as error:
+                last_error = error
+        assert last_error is not None
+        raise last_error
 
-                self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                try:
-                    self.tokenizer = AutoTokenizer.from_pretrained(self.model_name, local_files_only=True)
-                    self.model = AutoModelForSeq2SeqLM.from_pretrained(
-                        self.model_name, local_files_only=True
-                    ).to(self.device).eval()
-                except Exception:
-                    self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-                    self.model = AutoModelForSeq2SeqLM.from_pretrained(self.model_name).to(self.device).eval()
-                self._marian_loaded = True
-                return True
-            except Exception as e:
-                print(f"Warning: MarianMT load failed: {e}", flush=True)
-                return False
+    def _decoder_start_token_id(self) -> int | None:
+        if self.tgt_code is None:
+            return None
+        language_ids = getattr(self.tokenizer, "lang_code_to_id", None)
+        if isinstance(language_ids, dict) and self.tgt_code in language_ids:
+            return language_ids[self.tgt_code]
+        get_vocab = getattr(self.tokenizer, "get_vocab", None)
+        vocab = get_vocab() if callable(get_vocab) else {}
+        if self.tgt_code not in vocab:
+            return None
+        token_id = vocab.get(self.tgt_code)
+        if token_id is None:
+            convert = getattr(self.tokenizer, "convert_tokens_to_ids", None)
+            token_id = convert(self.tgt_code) if callable(convert) else None
+        return token_id
 
-    def _marian_translate(self, text: str) -> str:
-        if not self._ensure_marian():
-            return ""
-        import torch
-
-        with self._lock:
-            tokens = self.tokenizer([text], return_tensors="pt", truncation=True).to(self.device)
-            with torch.no_grad():
-                generated = self.model.generate(**tokens, max_new_tokens=48, num_beams=1, do_sample=False)
-            return self.tokenizer.decode(generated[0], skip_special_tokens=True).strip()
-
-    @lru_cache(maxsize=4096)
+    @lru_cache(maxsize=1024)
     def translate(self, text: str) -> str:
         cleaned, has_cano = clean_vi_prompt(text)
-        translated = ""
-
-        # Use Google Translate when engine is google (default)
-        if self.engine == "google":
-            try:
-                translated = _google_translate_raw(cleaned)
-            except Exception as e:
-                print(f"Warning: Google Translate failed: {e}", flush=True)
-
-            # Offline fallback to MarianMT if Google Translate was unreachable
-            if not translated:
-                try:
-                    translated = self._marian_translate(cleaned)
-                except Exception:
-                    pass
-        else:
-            translated = self._marian_translate(cleaned)
-
-        if not translated:
-            return ""
-
+        with self._lock:
+            tokens = self.tokenizer([cleaned], return_tensors="pt", truncation=True).to(self.device)
+            generate_kwargs = {
+                "max_new_tokens": 64,
+                "num_beams": 3,
+                "early_stopping": True,
+                "do_sample": False,
+            }
+            decoder_start_token_id = self._decoder_start_token_id()
+            if decoder_start_token_id is not None:
+                generate_kwargs["decoder_start_token_id"] = decoder_start_token_id
+            with torch.no_grad():
+                with torch.autocast(
+                    device_type="cuda",
+                    dtype=torch.float16,
+                    enabled=self.device.type == "cuda",
+                ):
+                    generated = self.model.generate(**tokens, **generate_kwargs)
+            translated = self.tokenizer.decode(generated[0], skip_special_tokens=True).strip()
         translated = re.sub(r"[.!?]+$", "", translated).strip()
         for pattern, repl in _EN_POST_REPLACEMENTS:
             translated = pattern.sub(repl, translated).strip()
