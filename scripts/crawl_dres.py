@@ -15,6 +15,7 @@ import json
 import os
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -167,7 +168,17 @@ class DresCrawler:
                 elif htype == "VIDEO" and not self.skip_media:
                     hint_vid_path = task_folder / f"hint_{h_idx}_query.mp4"
                     hint_url = f"{self.base_url}/api/v2/evaluation/{eval_id}/template/task/{task_id}/hint/{h_idx}/media"
-                    if self.download_file(hint_url, hint_vid_path, params={"session": self.session_id}):
+                    success = self.download_file(hint_url, hint_vid_path, params={"session": self.session_id})
+                    if not success:
+                        h_item = hint.get("item", {})
+                        h_media_id = hint.get("target") or h_item.get("mediaItemId")
+                        h_rng = hint.get("range", {})
+                        h_start = h_rng.get("start", {}).get("value", 0)
+                        h_end = h_rng.get("end", {}).get("value", h_start)
+                        if h_media_id:
+                            preview_url = f"{self.base_url}/api/v2/preview/{h_media_id}/{h_start}/{h_end}"
+                            success = self.download_file(preview_url, hint_vid_path, params={"session": self.session_id})
+                    if success:
                         hint_video_saved = str(hint_vid_path.relative_to(self.out_dir))
 
             full_prompt = "\n".join(text_descriptions).strip()
@@ -204,7 +215,13 @@ class DresCrawler:
                     if not self.skip_media:
                         ans_vid_path = task_folder / f"answer_{t_idx}.mp4"
                         ans_url = f"{self.base_url}/api/v2/evaluation/{eval_id}/template/task/{task_id}/target/{t_idx}/media"
-                        if self.download_file(ans_url, ans_vid_path, params={"session": self.session_id}):
+                        success = self.download_file(ans_url, ans_vid_path, params={"session": self.session_id})
+                        if not success:
+                            media_id = target.get("target") or item.get("mediaItemId")
+                            if media_id:
+                                preview_url = f"{self.base_url}/api/v2/preview/{media_id}/{target_start_ms}/{target_end_ms}"
+                                success = self.download_file(preview_url, ans_vid_path, params={"session": self.session_id})
+                        if success:
                             answer_video_saved = str(ans_vid_path.relative_to(self.out_dir))
 
                 elif ttype == "TEXT":
@@ -292,6 +309,7 @@ class DresCrawler:
                     print(f"    - {e['name']}: {e['id']}")
                 return
         else:
+            # Default to first active evaluation
             evals_to_crawl = [all_evals[0]]
 
         all_results = []
